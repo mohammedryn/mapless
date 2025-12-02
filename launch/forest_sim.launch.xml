@@ -1,0 +1,9 @@
+<launch>
+  <!-- Set TurtleBot3 Model -->
+  <set_env name="TURTLEBOT3_MODEL" value="burger"/>
+
+  <!-- Launch TurtleBot3 Gazebo World -->
+  <include file="$(find-pkg-share turtlebot3_gazebo)/launch/turtlebot3_world.launch.py"/>
+  
+  <!-- You can add more nodes here if needed for training, e.g. rviz -->
+</launch>

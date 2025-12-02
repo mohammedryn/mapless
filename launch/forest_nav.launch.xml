@@ -1,0 +1,11 @@
+<launch>
+  <arg name="mode" default="sim" description="sim or deploy"/>
+
+  <group if="$(eval '\'$(var mode)\' == \'sim\'')">
+    <include file="$(find-pkg-share mapless_navigation)/launch/forest_sim.launch.xml"/>
+  </group>
+
+  <group if="$(eval '\'$(var mode)\' == \'deploy\'')">
+    <include file="$(find-pkg-share mapless_navigation)/launch/deploy.launch.xml"/>
+  </group>
+</launch>

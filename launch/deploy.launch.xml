@@ -1,0 +1,8 @@
+<launch>
+  <arg name="model_path" default="ppo_forest_nav"/>
+
+  <!-- Launch Navigation Node -->
+  <node pkg="mapless_navigation" exec="navigation_node" name="navigation_node" output="screen">
+    <param name="model_path" value="$(var model_path)"/>
+  </node>
+</launch>

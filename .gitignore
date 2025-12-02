@@ -1,0 +1,6 @@
+*.mp4
+install/
+build/
+log/
+__pycache__/
+*.pyc

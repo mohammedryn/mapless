@@ -1,0 +1,14 @@
+# Rover Physical Parameters
+robot_radius: 0.22  # meters (TurtleBot3 Waffle Pi)
+max_linear_vel: 0.26
+max_angular_vel: 1.82
+min_linear_vel: -0.26
+min_angular_vel: -1.82
+
+# Safety
+safety_margin: 0.05
+scan_min_dist: 0.15
+
+# Sensor
+lidar_fov: 360  # degrees
+lidar_samples: 360

@@ -1,0 +1,24 @@
+# PPO Training Configuration
+total_timesteps: 2000000
+learning_rate: 0.0003
+n_steps: 2048
+batch_size: 64
+n_epochs: 10
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+ent_coef: 0.005
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+# Environment Configuration
+env_config:
+  scan_topic: "/scan"
+  cmd_vel_topic: "/cmd_vel"
+  odom_topic: "/odom"
+  lidar_ranges: 360
+  min_range: 0.12
+  max_range: 3.5
+  goal_distance_reward_weight: 1.0
+  collision_penalty: 100.0
+  goal_reached_reward: 100.0
