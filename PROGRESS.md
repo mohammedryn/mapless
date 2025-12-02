@@ -1,7 +1,7 @@
 # Project Progress & Deep-Dive Analysis: Mapless DRL Forest Navigation
 
 **Date:** December 2, 2025
-**Author:** Antigravity (AI Assistant) & User
+**Author:** Mohammed Rayan & User
 **Repository:** [mapless](https://github.com/mohammedryn/mapless)
 
 ---
