@@ -41,7 +41,7 @@ def main(args=None):
         tensorboard_log="./ppo_forest_tensorboard/"
     )
 
-    model_path = "ppo_forest_nav"
+    model_path = "models/ppo_forest_nav"
     
     if parsed_args.continue_training and os.path.exists(model_path + ".zip"):
         print(f"Loading existing model from {model_path}...")
@@ -50,7 +50,7 @@ def main(args=None):
     # Checkpoint Callback
     checkpoint_callback = CheckpointCallback(
         save_freq=50000,
-        save_path='./checkpoints/',
+        save_path='./models/checkpoints/',
         name_prefix='ppo_forest'
     )
 

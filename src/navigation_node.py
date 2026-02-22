@@ -15,7 +15,7 @@ class NavigationNode(Node):
         # Load Model
         # Assuming model is in the current directory or specified path
         # In a real package, this should be a parameter
-        self.declare_parameter('model_path', 'ppo_forest_nav')
+        self.declare_parameter('model_path', 'models/ppo_forest_nav')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         
         try:

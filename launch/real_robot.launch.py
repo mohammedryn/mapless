@@ -67,7 +67,7 @@ def generate_launch_description():
         executable='navigation_node',
         name='navigation_node',
         output='screen',
-        parameters=[{'model_path': 'ppo_forest_nav'}]
+        parameters=[{'model_path': 'models/ppo_forest_nav'}]
     )
 
     return LaunchDescription([
