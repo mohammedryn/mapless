@@ -12,3 +12,13 @@ scan_min_dist: 0.15
 # Sensor
 lidar_fov: 360  # degrees
 lidar_samples: 360
+
+# BTS7960 GPIO Pins (Raspberry Pi Setup)
+left_l_en: 22
+left_r_en: 23
+left_l_pwm: 18
+left_r_pwm: 19
+right_l_en: 17
+right_r_en: 27
+right_l_pwm: 12
+right_r_pwm: 13

@@ -8,7 +8,6 @@ setup(
     name=package_name,
     version='0.0.1',
     packages=[package_name],
-    package_dir={package_name: 'src'},
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -28,6 +27,7 @@ setup(
             'train_ppo = mapless_navigation.train_ppo:main',
             'navigation_node = mapless_navigation.navigation_node:main',
             'sabertooth_driver = mapless_navigation.sabertooth_driver:main',
+            'bts7960_driver = mapless_navigation.bts7960_driver:main',
         ],
     },
 )

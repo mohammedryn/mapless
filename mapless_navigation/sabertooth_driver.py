@@ -1,9 +1,11 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 import serial
 import time
 import math
+import numpy as np
 
 class SabertoothDriver(Node):
     def __init__(self):
@@ -16,10 +18,15 @@ class SabertoothDriver(Node):
         self.declare_parameter('max_speed_linear', 0.5) # m/s
         self.declare_parameter('max_speed_angular', 2.0) # rad/s
         
+        self.declare_parameter('scan_min_dist', 0.15) # Safety margin
+
         self.port = self.get_parameter('serial_port').value
         self.baud = self.get_parameter('baud_rate').value
         self.address = self.get_parameter('address').value
+        self.scan_min_dist = self.get_parameter('scan_min_dist').value
         
+        self.emergency_stop = False
+
         # Connect to Serial
         try:
             self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
@@ -28,19 +35,42 @@ class SabertoothDriver(Node):
             self.get_logger().error(f"Failed to connect to serial: {e}")
             self.serial = None
 
-        # Subscriber
-        self.subscription = self.create_subscription(
+        # Subscribers
+        self.cmd_sub = self.create_subscription(
             Twist,
             '/cmd_vel',
             self.cmd_vel_callback,
             10
         )
         
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
+        
         # Stop motors on shutdown
         rclpy.get_default_context().on_shutdown(self.stop_motors)
 
+    def scan_callback(self, msg):
+        ranges = np.array(msg.ranges)
+        ranges = np.nan_to_num(ranges, nan=99.0, posinf=99.0, neginf=0.0)
+        
+        if len(ranges) > 0 and np.min(ranges) < self.scan_min_dist:
+            if not self.emergency_stop:
+                self.get_logger().warn("🚨 SAFETY OVERRIDE: Obstacle too close! Halting motors.")
+            self.emergency_stop = True
+        else:
+            self.emergency_stop = False
+
     def cmd_vel_callback(self, msg):
         if not self.serial:
+            return
+
+        if self.emergency_stop:
+            self.send_motor_command(1, 0.0)
+            self.send_motor_command(2, 0.0)
             return
 
         # Differential Drive Kinematics

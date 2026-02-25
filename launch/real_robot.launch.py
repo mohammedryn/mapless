@@ -53,12 +53,19 @@ def generate_launch_description():
         output='screen'
     )
 
+    rover_config = os.path.join(
+        get_package_share_directory(pkg_name),
+        'config',
+        'rover.yaml'
+    )
+
     # Motor Driver (Custom Node)
     motor_driver_node = Node(
         package=pkg_name,
-        executable='sabertooth_driver', # We need to create this!
-        name='sabertooth_driver',
-        output='screen'
+        executable='bts7960_driver', 
+        name='bts7960_driver',
+        output='screen',
+        parameters=[rover_config] # Load safety and speed limits
     )
 
     # Navigation Node (DRL Agent)
@@ -67,7 +74,10 @@ def generate_launch_description():
         executable='navigation_node',
         name='navigation_node',
         output='screen',
-        parameters=[{'model_path': 'models/ppo_forest_nav'}]
+        parameters=[
+            {'model_path': 'models/ppo_forest_nav'},
+            rover_config # Load max speed limits
+        ]
     )
 
     return LaunchDescription([

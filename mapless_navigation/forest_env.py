@@ -71,10 +71,37 @@ class ForestEnv(gym.Env):
         self.goal_x = 5.0 # Example goal
         self.goal_y = 0.0
         
-        self.max_linear_vel = 0.26
-        self.max_angular_vel = 1.82
-        self.min_range = 0.12
-        self.collision_dist = 0.20
+        import yaml
+        import os
+        from ament_index_python.packages import get_package_share_directory
+
+        # Load configuration
+        try:
+            pkg_share = get_package_share_directory('mapless_navigation')
+            rover_config_path = os.path.join(pkg_share, 'config', 'rover.yaml')
+            training_config_path = os.path.join(pkg_share, 'config', 'training.yaml')
+
+            with open(rover_config_path, 'r') as f:
+                rover_config = yaml.safe_load(f)
+            with open(training_config_path, 'r') as f:
+                training_config = yaml.safe_load(f)
+                env_config = training_config.get('env_config', {})
+
+            self.max_linear_vel = float(rover_config.get('max_linear_vel', 0.26))
+            self.max_angular_vel = float(rover_config.get('max_angular_vel', 1.82))
+            
+            self.collision_dist = float(env_config.get('collision_penalty_dist', 0.20)) # Using a sensible name or fallback
+            self.collision_penalty = float(env_config.get('collision_penalty', 100.0))
+            self.goal_reached_reward = float(env_config.get('goal_reached_reward', 100.0))
+            
+        except Exception as e:
+            # Fallback to defaults if config loading fails
+            self.node.get_logger().error(f"Failed to load config, using defaults: {e}")
+            self.max_linear_vel = 0.26
+            self.max_angular_vel = 1.82
+            self.collision_dist = 0.20
+            self.collision_penalty = 100.0
+            self.goal_reached_reward = 100.0
 
     def scan_callback(self, msg):
         # Process scan data: take 360 points, handle infs
@@ -198,11 +225,11 @@ class ForestEnv(gym.Env):
         
         # Collision
         if min_laser < self.collision_dist:
-            reward = -100.0
+            reward = -abs(self.collision_penalty)
             done = True
         # Goal Reached
         elif dist_to_goal < 0.5:
-            reward = 100.0
+            reward = abs(self.goal_reached_reward)
             done = True
         else:
             # Progress reward

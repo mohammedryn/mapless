@@ -16,6 +16,8 @@ class NavigationNode(Node):
         # Assuming model is in the current directory or specified path
         # In a real package, this should be a parameter
         self.declare_parameter('model_path', 'models/ppo_forest_nav')
+        self.declare_parameter('max_linear_vel', 0.26)
+        self.declare_parameter('max_angular_vel', 1.82)
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         
         try:
@@ -105,9 +107,9 @@ class NavigationNode(Node):
         obs = self.get_obs()
         action, _ = self.model.predict(obs, deterministic=True)
         
-        # Action scaling (must match environment)
-        max_linear_vel = 0.26
-        max_angular_vel = 1.82
+        # Action scaling (from config)
+        max_linear_vel = self.get_parameter('max_linear_vel').get_parameter_value().double_value
+        max_angular_vel = self.get_parameter('max_angular_vel').get_parameter_value().double_value
         
         linear_vel = (action[0] + 1.0) / 2.0 * max_linear_vel
         angular_vel = action[1] * max_angular_vel

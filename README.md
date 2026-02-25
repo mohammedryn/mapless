@@ -93,15 +93,15 @@ else:
 
 ## 🔧 Hardware
 
-| Component | Model | Role |
+| Component | Specification / Details | Role |
 | :--- | :--- | :--- |
-| **Compute** | NVIDIA Jetson Orin Nano 8GB | Runs all ROS2 nodes + neural network inference |
-| **Lidar** | Slamtec C1M1 R2 | 360° obstacle detection + odometry source |
-| **Motor Driver** | Sabertooth 2x32 | Differential drive control via Packet Serial |
-| **Motors** | JGB37 (x4) | Drive wheels |
-| **Power** | LiPo / 12-24V Lead Acid | System power |
-
-> **Note:** The chassis has **no wheel encoders**. Odometry is derived entirely from Lidar scan-matching using `rf2o_laser_odometry`.
+| **Compute** | Raspberry Pi 5 (8GB) | Runs ROS2, handles Lidar Odometry, and executes the PPO inference. |
+| **Lidar** | Slamtec Lidar C1M1 R2 | Primary sensor for obstacle detection and encoder-less odometry. |
+| **Motor Drivers**| 2x BTS7960 43A Drivers | High-current PWM drivers for the left and right motor banks. |
+| **Motors** | 4x JGB37 DC Motors | High-torque propulsion (No encoders needed). |
+| **Vision** | Raspberry Pi HQ Camera | (Optional) Future integration for vision-language models. |
+| **Power** | 12V LiPo Battery | Dedicated power for motors and buck-converter for Pi 5. |
+Odometry is derived entirely from Lidar scan-matching using `rf2o_laser_odometry`.
 
 ---
 
