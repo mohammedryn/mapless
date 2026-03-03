@@ -4,7 +4,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
 import time
 import math
@@ -44,10 +44,9 @@ class ForestEnv(gym.Env):
             self.odom_callback,
             10
         )
-        self.cmd_vel_pub = self.node.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_vel_pub = self.node.create_publisher(TwistStamped, '/cmd_vel', 10)
         
-        # Reset Service Client
-        self.reset_client = self.node.create_client(Empty, '/reset_simulation')
+        # No need for reset_client, will use subprocess to reset Gazebo directly
 
         # Action space: [linear_vel, angular_vel]
         # Normalized action space [-1, 1]
@@ -70,6 +69,8 @@ class ForestEnv(gym.Env):
         self.current_odom = None
         self.goal_x = 5.0 # Example goal
         self.goal_y = 0.0
+        self.step_count = 0
+        self.max_steps = 500  # Truncate episodes to prevent infinite loops
         
         import yaml
         import os
@@ -126,14 +127,16 @@ class ForestEnv(gym.Env):
         # Spin ROS to get latest messages
         rclpy.spin_once(self.node, timeout_sec=0.0)
 
+        self.step_count += 1
+
         # Execute action
         linear_vel = (action[0] + 1.0) / 2.0 * self.max_linear_vel # Map [-1, 1] to [0, max]
         angular_vel = action[1] * self.max_angular_vel
 
-        twist = Twist()
-        twist.linear.x = float(linear_vel)
-        twist.angular.z = float(angular_vel)
-        self.cmd_vel_pub.publish(twist)
+        msg = TwistStamped()
+        msg.twist.linear.x = float(linear_vel)
+        msg.twist.angular.z = float(angular_vel)
+        self.cmd_vel_pub.publish(msg)
 
         # Wait a bit for action to take effect (simple simulation step)
         # In real training, this might need better synchronization
@@ -145,25 +148,35 @@ class ForestEnv(gym.Env):
         # Calculate reward
         reward, done = self._calculate_reward(obs)
         
+        # Check episode truncation (max steps exceeded)
+        truncated = self.step_count >= self.max_steps
+        
         info = {}
         
-        return obs, reward, done, False, info
+        return obs, reward, done, truncated, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
         # Reset robot (in simulation this might involve a service call to Gazebo)
         # For now, we just stop the robot
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+        msg = TwistStamped()
+        self.cmd_vel_pub.publish(msg)
 
-        # Call reset service
-        while not self.reset_client.wait_for_service(timeout_sec=1.0):
-            self.node.get_logger().info('reset service not available, waiting again...')
-        
-        req = Empty.Request()
-        future = self.reset_client.call_async(req)
-        rclpy.spin_until_future_complete(self.node, future)
+        self.step_count = 0  # Reset step counter
+
+        # Reset robot position near edge of maze (close to walls for faster learning)
+        import subprocess
+        try:
+            req_str = 'name: "burger", position: {x: -2.0, y: -0.5, z: 0.05}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
+            subprocess.run(["gz", "service", "-s", "/world/default/set_pose", 
+                            "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean", 
+                            "--timeout", "2000", "--req", req_str],
+                           check=True, capture_output=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            self.node.get_logger().warn('set_pose timed out, continuing anyway')
+        except subprocess.CalledProcessError as e:
+            self.node.get_logger().error(f'Failed to reset robot pose: {e.stderr}')
         
         # Randomize goal
         self.goal_x = np.random.uniform(2.0, 8.0)
