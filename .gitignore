@@ -4,3 +4,5 @@ build/
 log/
 __pycache__/
 *.pyc
+ppo_forest_tensorboard/
+*.zip
