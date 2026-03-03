@@ -1,4 +1,5 @@
 # Mapless DRL Forest Navigation
+
 ## End-to-End Deep Reinforcement Learning for Autonomous Rover Navigation in Unstructured Terrain - Detailed README
 
 **Project 8 – Final Project**
