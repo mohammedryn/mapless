@@ -1,897 +1,491 @@
-# Mapless DRL Forest Navigation
-## End-to-End Deep Reinforcement Learning for Autonomous Rover Navigation in Unstructured Terrain - Detailed README
+# Mapless DRL Navigation — Technical Reference
 
-**Project 8 – Final Project**
+**End-to-end deep reinforcement learning for autonomous rover navigation without maps.**
 
----
-
-## Overview
-
-Mapless DRL Forest Navigation is an end-to-end deep reinforcement learning system that enables autonomous rovers to navigate through complex, unstructured forest environments without pre-built maps, relying solely on onboard sensors (camera, LIDAR, or both) and learned policies. Unlike traditional path-planning algorithms that require global maps and localization, mapless DRL learns direct sensorimotor control policies from raw observations (images/point clouds) to motor commands. This approach excels in GPS-denied, dynamic, and GPS-unavailable environments—ideal for your rover conducting autonomous missions through dense forests, rough terrain, and unknown obstacles. The system learns collision-free navigation, obstacle avoidance, goal-reaching behavior, and terrain adaptation through large-scale simulation training followed by zero-shot or low-shot sim-to-real transfer.
+> This document describes the **actual, implemented system** as of the current codebase.
+> Every detail — observation dimensions, reward weights, network architecture, config keys —
+> matches the running code.  It is intended as a primary reference for code review,
+> technical interviews, and future development.
 
 ---
 
 ## Table of Contents
 
-1. What is Mapless DRL Navigation?
-2. Why End-to-End Learning Over Traditional Planning?
-3. DRL Algorithms for Navigation
-4. System Architecture & Sensorimotor Pipeline
-5. Simulation Environment Setup (Gazebo + Isaac Sim)
-6. Reward Function Design (Critical for Success)
-7. Training Pipeline & Sample Efficiency
-8. Scenario Augmentation for Generalization
-9. Sim-to-Real Transfer Strategy
-10. Real Robot Deployment on Your Rover
-11. Performance Benchmarks & Results
-12. Integration with ROS2
-13. Advanced: Hierarchical RL, Meta-Learning, Curriculum Learning
-14. Troubleshooting & Optimization
-15. References & Further Reading
+1. [System Overview](#1-system-overview)
+2. [Hardware Stack](#2-hardware-stack)
+3. [Software Architecture](#3-software-architecture)
+4. [Observation Space](#4-observation-space)
+5. [Action Space](#5-action-space)
+6. [Reward Function](#6-reward-function)
+7. [Policy Network Architecture](#7-policy-network-architecture)
+8. [Domain Randomisation](#8-domain-randomisation)
+9. [Sensor Fusion (EKF)](#9-sensor-fusion-ekf)
+10. [Training Pipeline](#10-training-pipeline)
+11. [Sim-to-Real Transfer](#11-sim-to-real-transfer)
+12. [Deployment Pipeline](#12-deployment-pipeline)
+13. [Evaluation Methodology](#13-evaluation-methodology)
+14. [Configuration Reference](#14-configuration-reference)
+15. [Known Limitations and Future Work](#15-known-limitations-and-future-work)
 
 ---
 
-## 1. What is Mapless DRL Navigation?
+## 1. System Overview
 
-### Key Concept
-- **Mapless:** No global map construction; navigation from local observations
-- **DRL:** Uses PPO, SAC, TD3, or similar actor-critic algorithms
-- **End-to-End:** Directly map sensor inputs → motor actions
-- **Forest/Unstructured:** Handles irregular terrain, dense obstacles, varying lighting
+This project implements mapless navigation: a ground robot learns a reactive obstacle-avoidance
+and goal-reaching policy from simulated experience, then deploys the policy on real hardware
+without map construction or localization.
 
-### Capabilities
-- Navigate through unknown environments at 8–12 km/h
-- Avoid static and dynamic obstacles in real-time
-- Adapt to terrain changes (grass, rocks, slopes, mud)
-- Learn collision-free paths from experience
-- Generalize to unseen environments with domain randomization
+**What makes this approach different from standard SLAM + path-planning:**
 
-### Applications for Your Rover
-- Forest exploration and mapping
-- Search & rescue missions
-- Agricultural field navigation
-- Autonomous inspection of rough terrain
-- Environmental survey in GPS-denied zones
+| Property | Traditional (SLAM + Nav2) | This Project (DRL Mapless) |
+|---|---|---|
+| World model | Pre-built occupancy map | None — purely reactive |
+| Compute at runtime | Path planner + controller | Single forward pass through MLP |
+| New environments | Requires re-mapping | Zero-shot generalization |
+| Dynamic obstacles | Requires re-planning | Handled implicitly by policy |
+| Odometry requirement | Full localization | Relative goal bearing only |
 
----
-
-## 2. Why End-to-End Learning Over Traditional Planning?
-
-### Comparison: Traditional vs. DRL Navigation
-
-| Aspect | Traditional (Maps+Planning) | DRL (Mapless) |
-|--------|---------------------------|--------------|
-| **Map Requirement** | ✅ Must have map | ❌ No map needed |
-| **Localization** | ✅ Needed (GPS/SLAM) | ❌ Local observations only |
-| **Computation** | ⚠️ Complex planner | ✅ Simple neural network |
-| **Real-time Adaptivity** | ⚠️ Slow replanning | ✅ Instant (learned policy) |
-| **Dynamic Obstacles** | ❌ Limited | ✅ Learned behavior |
-| **Terrain Adaptation** | ❌ Fixed algorithms | ✅ Learned from data |
-| **Sim-to-Real Transfer** | ❌ Brittle | ✅ With domain randomization |
-| **Scaling** | ❌ Doesn't scale well | ✅ Scales with data |
-
-### Real-World Example
-```
-Traditional Approach (Forest A):
-├─ Build SLAM map (30 min + calibration)
-├─ Plan path using RRT/A* (1–5 sec)
-├─ Execute with PID control
-└─ Fails on Forest B (new environment, must rebuild map)
-
-DRL Approach (Any Forest):
-├─ Train policy in simulation (2–4 hours)
-├─ Deploy on rover (instant execution)
-├─ Works on Forest A, B, C, D without retraining
-└─ Continues to adapt in real-time
-```
+The core design choices:
+- **PPO** (or SAC) because the task has dense reward signal and a continuous action space; both are well-understood with many reference implementations.
+- **Lidar-only observations** to sidestep camera calibration and lighting variance in early hardware testing.
+- **rf2o scan-matching** for encoder-less odometry — avoids wheel encoders entirely on the JGB37 motors.
+- **MPU-6050 EKF fusion** to compensate for rf2o drift during fast turns.
 
 ---
 
-## 3. DRL Algorithms for Navigation
+## 2. Hardware Stack
 
-### Algorithm Comparison for Your Setup (RTX 4050)
+### Compute
 
-| Algorithm | Stability | Sample Efficiency | Real-Time | Notes |
-|-----------|-----------|------------------|-----------|-------|
-| **PPO (Proximal Policy Optimization)** | ⭐⭐⭐ Excellent | ⭐⭐ Good | ✅ Fast | Most popular, easiest to tune |
-| **SAC (Soft Actor-Critic)** | ⭐⭐ Good | ⭐⭐⭐ Excellent | ⚠️ Slower | Off-policy, sample-efficient |
-| **TD3 (Twin Delayed DDPG)** | ⭐⭐ Good | ⭐ Fair | ✅ Fast | Deterministic, stable |
-| **DDPG (Deep Deterministic Policy Gradient)** | ⭐ Variable | ⭐ Fair | ✅ Fast | Older, less stable |
-| **Hierarchical RL (HRL)** | ⭐⭐⭐ Excellent | ⭐⭐⭐ Excellent | ✅ Very Fast | Two-level policy (subgoals) |
+| Component | Part | Notes |
+|---|---|---|
+| SBC | Raspberry Pi 5 (8 GB RAM) | ROS 2 Jazzy, gpiozero + lgpio backend for Pi 5 GPIO |
+| OS | Ubuntu 24.04 LTS | Required for ROS 2 Jazzy |
 
-### **Recommended for Your Project: PPO**
-- Easiest to implement and tune
-- Excellent stability for navigation
-- Handles continuous action spaces (motor control)
-- Works well on RTX 4050 with moderate training time
-- Industry standard (used in robotics, autonomous driving)
+### Sensors
 
----
+| Sensor | Part | Interface | Key Spec |
+|---|---|---|---|
+| Lidar | Slamtec C1M1 R2 | USB → `/dev/ttyUSB0` | 360°, 12 m range, DTOF, 5000 samples/s |
+| IMU | MPU-6050 | I2C bus 1, addr `0x68` | 3-axis gyro + 3-axis accel, 50 Hz |
+| Camera | Pi HQ Camera (IMX477) | CSI | 12.3 MP — reserved for future visual goal work |
 
-## 4. System Architecture & Sensorimotor Pipeline
+**Critical lidar note:** The C1M1 R2 has a 12.0 m maximum range. Earlier versions of this
+codebase (and the simulation model) used 3.5 m (RPLIDAR A1 spec).
+Normalising by the wrong constant clips all readings between 3.5 m and 12 m to 1.0 —
+the policy receives a saturated observation it was never trained on. This has been
+corrected: `LIDAR_MAX_RANGE = 12.0` in `obs_utils.py` and `max_range: 12.0` in
+`config/training.yaml`.
 
-### High-Level Block Diagram
+### Actuation
 
-```
-┌────────────────────────────────────────────────┐
-│           SENSOR INPUT (Rover)                 │
-│  ├─ RGB Camera (320×240, 30Hz)                │
-│  ├─ LIDAR Scan (360°, 12 pts/line, 10Hz)     │
-│  └─ Odometry (wheel encoders, IMU)           │
-└────────────────────────────────────────────────┘
-                        ↓
-┌────────────────────────────────────────────────┐
-│        PERCEPTION MODULE (Learned)             │
-│  ├─ Vision CNN: ResNet18 backbone             │
-│  ├─ LIDAR encoder: PointNet or MLP            │
-│  ├─ Fusion: Concatenate encoded features      │
-│  └─ Observation space: (384,) vector          │
-└────────────────────────────────────────────────┘
-                        ↓
-┌────────────────────────────────────────────────┐
-│        POLICY NETWORK (PPO Actor)              │
-│  ├─ Input: Observation (384,)                 │
-│  ├─ Hidden layers: 256 → 256 → 128            │
-│  ├─ Output: Mean & std of actions             │
-│  └─ Output space: Linear + Angular velocity   │
-└────────────────────────────────────────────────┘
-                        ↓
-┌────────────────────────────────────────────────┐
-│      ACTION SAMPLING & SMOOTHING              │
-│  ├─ Sample from policy distribution           │
-│  ├─ Clip to valid ranges                      │
-│  ├─ Apply temporal smoothing (optional)       │
-│  └─ Actions: [v_linear, v_angular]            │
-└────────────────────────────────────────────────┘
-                        ↓
-┌────────────────────────────────────────────────┐
-│        ROBOT CONTROL (ROS2 Topics)            │
-│  ├─ Convert to motor commands                 │
-│  ├─ Send via /cmd_vel topic                   │
-│  └─ Rover executes → Observe feedback         │
-└────────────────────────────────────────────────┘
-```
-
-### Observation Space (What the Policy Sees)
-```python
-observation = {
-    'camera_image': (3, 64, 64),        # Downsampled, grayscale
-    'lidar_scan': (360,),               # Range measurements
-    'egocentric_velocity': (2,),        # [linear, angular] current state
-    'relative_goal_position': (2,),     # [distance, angle] to goal
-    'time_since_last_collision': (1,)   # Temporal history
-}
-# Total: ~400 features (CNN reduces camera to ~256 features)
-```
-
-### Action Space (What the Policy Controls)
-```python
-action = {
-    'linear_velocity': [-0.5, 1.5],     # m/s (backward to forward)
-    'angular_velocity': [-1.0, 1.0]     # rad/s (left to right turn)
-}
-# 2D continuous action space
-```
+| Component | Part | Interface |
+|---|---|---|
+| Motor drivers | 2x BTS7960 43A H-bridge | GPIO/PWM via `gpiozero` (lgpio) |
+| Motors | 4x JGB37 DC gear motor | No encoders — 4WD skid-steer |
+| Power | 12V LiPo | Buck converter → 5V/5A for Pi 5 |
 
 ---
 
-## 5. Simulation Environment Setup
+## 3. Software Architecture
 
-### Option A: Gazebo + TurtleBot3 (Easiest for Your Setup)
+### ROS 2 Node Graph (real robot)
+
+```
+/scan ──────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  ▼                                                                  ▼
+rf2o_laser_odometry_node          NavigationNode (10 Hz)
+  (scan-matching → /odom)           ├─ /scan          ─ LaserScan
+       │                             ├─ /odometry/filtered ─ Odometry (EKF)
+       ▼ /odom                       │    (fallback: /odom)
+robot_localization:ekf_node         ├─ /goal_xy ─ Float64MultiArray
+  (fuses /odom + /imu/data           └─ /cmd_vel ──►  Twist
+   → /odometry/filtered)
+       ▲ /imu/data
+mpu6050_driver_node
+
+/cmd_vel ──►  bts7960_driver  ──► GPIO PWM ──► JGB37 motors
+              (also reads /scan for hardware safety override)
+```
+
+### The obs_utils contract
+
+`obs_utils.py` is the single source of truth for observation construction.
+Both `ForestEnv` (training) and `NavigationNode` (deployment) call
+`obs_utils.build_observation()`. If the observation pipeline ever changes,
+it changes in one place and both contexts pick it up automatically.
+This eliminates silent failure where training and deployment observe different
+distributions and the policy underperforms at test time.
+
+---
+
+## 4. Observation Space
+
+**Dimension:** 362-dimensional `float32` vector.
+
+| Index | Quantity | Construction | Range |
+|---|---|---|---|
+| `[0..359]` | 360 lidar ranges | Downsampled/padded to 360 pts; divided by `LIDAR_MAX_RANGE` (12.0 m); NaN/inf → 1.0 | [0, 1] |
+| `[360]` | Distance to goal | Euclidean metres / 10.0, clipped to [0, 1] | [0, 1] |
+| `[361]` | Bearing to goal | `atan2(dy, dx) − yaw`, wrapped to [−π, π], divided by π | [−1, 1] |
+
+**Implementation:** `obs_utils.build_observation()` in `mapless_navigation/obs_utils.py`.
+
+**Scan resampling:** If the lidar returns more than 360 points, every `floor(N/360)`-th
+reading is taken. If fewer (unlikely for C1M1 R2), zero-padding at `max_range` is applied.
+
+**Lidar noise (training only):** Per-episode Gaussian noise `N(0, σ)` is added before
+normalisation. `σ` is sampled uniformly from `[0, lidar_noise_std]` at each `reset()`.
+Deployment always calls `build_observation(..., lidar_noise_std=0.0)`.
+
+---
+
+## 5. Action Space
+
+**Dimension:** 2-dimensional `float32` in `[−1, 1]`.
+
+| Index | Policy output | Mapped value |
+|---|---|---|
+| `[0]` | Raw linear command | `(a[0] + 1) / 2 × max_linear_vel × speed_scale` → [0, 0.26] m/s |
+| `[1]` | Raw angular command | `a[1] × max_angular_vel` → [−1.82, 1.82] rad/s |
+
+The linear mapping restricts to forward-only motion. Reverse is not needed for the
+current goal-reaching task and simplifies the learned policy.
+
+`speed_scale` is a per-episode domain randomisation factor. It applies only to linear
+velocity because angular velocity is a purely geometric constraint (turning circle),
+not affected by motor output variance.
+
+---
+
+## 6. Reward Function
+
+Implemented in `ForestEnv._calculate_reward()` in `mapless_navigation/forest_env.py`.
+
+```
+at each step:
+
+  min_laser = min(raw, unnoised lidar ranges)
+
+  if min_laser < collision_dist (0.20 m):
+      reward = −collision_penalty (−100)
+      done   = True
+
+  elif dist_to_goal < goal_reached_dist (0.50 m):
+      reward = +goal_reached_reward (+100)
+      done   = True
+
+  else:
+      progress = prev_distance − curr_distance
+      reward   = progress × 10.0
+               − prox_weight × max(0, prox_dist − min_laser)
+               − ang_penalty_weight × |action[1]|
+               − 0.1                               # time penalty
+```
+
+**Design rationale:**
+
+| Component | Purpose |
+|---|---|
+| Progress × 10 | Dense signal — policy gets reward every step, not only at goal |
+| Proximity penalty | Discourages hugging walls even when collision threshold is not reached |
+| Angular penalty | Promotes smooth, energy-efficient paths; discourages oscillatory turning |
+| Time penalty −0.1 | Encourages shortest path; prevents standing still |
+| Collision −100 | Hard terminal signal |
+| Goal +100 | Terminal positive signal; sized to dominate episode return |
+
+**Collision detection uses unnoised ranges.** Domain-randomisation noise is added to
+the observation but not to the reward collision check. The penalty signal is accurate
+regardless of noise level.
+
+---
+
+## 7. Policy Network Architecture
+
+### Option A: Conv1D (default, `policy_type: conv1d`)
+
+Implemented in `LidarConvExtractor` in `mapless_navigation/train_ppo.py`.
+
+```
+Input: 362-dim observation
+         │
+    ┌────┴───────────────────────┐   ┌─────────────┐
+    │ Lidar branch (360 pts)     │   │ Goal branch │
+    │ unsqueeze → (B, 1, 360)    │   │  (2 values) │
+    │ Conv1d(1→32, k=5)          │   │ Linear(2→32)│
+    │ ReLU                       │   │ ReLU        │
+    │ Conv1d(32→64, k=3)         │   └─────┬───────┘
+    │ ReLU                       │         │ 32
+    │ AdaptiveAvgPool1d(45)      │         │
+    │ Flatten → 2880             │         │
+    └────────────────┬───────────┘         │
+                     └─────────────────────┘
+                                │ 2912
+                        Linear(2912 → 256)
+                        ReLU
+                                │ 256
+                      SB3 Actor / Critic heads
+```
+
+**Why Conv1D for lidar?** The 360 rays form a circular 1-D signal. Adjacent rays are
+physically adjacent angles. A 1-D conv kernel learns local gap and edge detectors
+(e.g., "gap of width W at angle θ") which are translation-equivariant across the scan
+ring. A flat MLP has no such prior and must learn angle-specific features separately.
+
+### Option B: Flat MLP (`policy_type: mlp`)
+
+Standard `MlpPolicy` from SB3 with default hidden layers [64, 64]. Used as a baseline
+to quantify the benefit of Conv1D in ablation experiments.
+
+---
+
+## 8. Domain Randomisation
+
+Applied at every `ForestEnv.reset()`. All parameters are in
+`config/training.yaml` under `env_config.domain_rand`.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `lidar_noise_std` | 0.03 m | Maximum σ for Gaussian lidar noise. Per episode, σ ~ Uniform(0, 0.03). Applied before normalisation. |
+| `speed_scale_min` | 0.85 | Lower bound for per-episode speed scale factor. |
+| `speed_scale_max` | 1.15 | Upper bound. Scale ~ Uniform(0.85, 1.15) per episode; applied to `max_linear_vel`. |
+
+**Motivation:**
+1. **Lidar noise** — the simulated sensor is noiseless; the real C1M1 R2 has
+   ±2–3 cm measurement uncertainty. Injecting noise trains the policy to be
+   robust to small perturbations rather than overfitting to perfect range values.
+2. **Speed scale** — the JGB37 motors have no encoders. Actual wheel speed varies
+   with battery charge, load, and motor-to-motor manufacturing differences.
+   Randomising effective speed prevents the policy from assuming precise velocity.
+
+**To disable domain randomisation** (clean baseline run):
+```yaml
+domain_rand:
+  lidar_noise_std: 0.0
+  speed_scale_min: 1.0
+  speed_scale_max: 1.0
+```
+
+---
+
+## 9. Sensor Fusion (EKF)
+
+### Problem: lidar-only odometry limitations
+
+`rf2o_laser_odometry` degrades in two scenarios:
+- **Featureless areas** — long straight corridors with no perpendicular features
+  provide insufficient scan-to-scan constraints on yaw.
+- **Fast rotations** — at 10 Hz, aggressive in-place turns can move features out
+  of the field of view between scans.
+
+### Solution: MPU-6050 + robot_localization EKF
+
+The `robot_localization` EKF fuses `/odom` (rf2o) and `/imu/data` (MPU-6050) to
+produce `/odometry/filtered`.
+
+| Source | Fused quantities |
+|---|---|
+| rf2o (`/odom`) | x, y position; yaw; x velocity; yaw-rate |
+| MPU-6050 (`/imu/data`) | yaw orientation; yaw angular rate; x/y linear acceleration |
+
+The IMU gyroscope provides 50 Hz yaw estimates that bridge the 10 Hz gaps in rf2o.
+The accelerometer provides forward acceleration independent of scan quality.
+
+**Key EKF config settings** (`config/ekf.yaml`):
+- `two_d_mode: true` — ground plane constraint
+- `imu0_remove_gravitational_acceleration: true` — essential for MPU-6050 (z-accel = +9.8 m/s² at rest)
+- `frequency: 30.0 Hz` — 3× the rf2o rate for smooth output
+
+### Graceful fallback
+
+`NavigationNode` subscribes to both `/odometry/filtered` and `/odom`. If the EKF
+is not running, the node falls back to raw rf2o odometry automatically.
+
+---
+
+## 10. Training Pipeline
+
+### Environment flow
+
+```
+ForestEnv.reset()
+  ├─ Stop robot (empty TwistStamped)
+  ├─ Sample domain randomisation params (lidar_noise_std, speed_scale)
+  ├─ Randomise goal position within config bounds
+  ├─ Teleport robot to spawn via gz service CLI
+  ├─ Flush stale scan buffer (fill with max_range)
+  └─ Return initial observation
+
+ForestEnv.step(action)
+  ├─ Map action → velocity (with speed_scale on linear)
+  ├─ Publish TwistStamped to /cmd_vel
+  ├─ Sleep 50 ms
+  ├─ Build observation via obs_utils.build_observation()
+  ├─ Compute reward via _calculate_reward()
+  └─ Return (obs, reward, done, truncated, info)
+```
+
+### PPO hyperparameters (from `config/training.yaml`)
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `n_steps` | 2048 | Steps collected before each policy update |
+| `batch_size` | 64 | Mini-batch size |
+| `n_epochs` | 10 | Passes over each rollout buffer |
+| `gamma` | 0.99 | High discount — must plan across ~500 steps |
+| `gae_lambda` | 0.95 | GAE trade-off between bias and variance |
+| `clip_range` | 0.2 | PPO clipping |
+| `ent_coef` | 0.005 | Entropy bonus for exploration |
+
+### Callbacks
+
+- `CheckpointCallback`: saves every 50,000 steps to `models/checkpoints/`
+- `EvalCallback`: evaluates 20 episodes every 25,000 steps; saves best model to `models/best_model/`
+
+---
+
+## 11. Sim-to-Real Transfer
+
+### Sources of the sim-to-real gap
+
+| Gap | Issue | Mitigation |
+|---|---|---|
+| Lidar max range | Previously 3.5 m vs C1M1's 12.0 m | **Fixed**: `max_range: 12.0` everywhere |
+| Lidar noise | Simulation noiseless; real sensor ±2–3 cm | Domain rand: `lidar_noise_std: 0.03` |
+| Motor variation | ±15% across battery levels and motors | Domain rand: speed scale [0.85, 1.15] |
+| Observation pipeline | Previously separate code in training vs deploy | **Fixed**: single `obs_utils.py` |
+| Physics fidelity | Ideal contact vs real tire/floor | Lower `max_linear_vel` for first real tests |
+| Odometry quality | Simulation perfect; rf2o drifts | IMU EKF fusion on real robot |
+
+---
+
+## 12. Deployment Pipeline
+
+### Full stack launch
 
 ```bash
-# Install Gazebo and TurtleBot3
-sudo apt install ros-humble-gazebo-*
-sudo apt install ros-humble-turtlebot3-*
-
-# Clone and build
-git clone https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git
-colcon build
-
-# Launch forest environment
-ros2 launch turtlebot3_gazebo turtlebot3_forest.launch.py
+ros2 launch mapless_navigation real_robot.launch.py goal_x:=5.0 goal_y:=0.0
 ```
 
-### Option B: Isaac Sim (Advanced, More Realistic)
+Starts 8 nodes: lidar driver → TF publishers → rf2o odometry → IMU driver → EKF → motor driver → navigation node.
+
+### NavigationNode control loop
+
+```python
+def _control_loop(self):
+    odom = odom_filtered or odom_raw        # EKF preferred, rf2o fallback
+    obs, _ = obs_utils.build_observation(   # identical to training
+        raw_scan, odom, goal_x, goal_y, lidar_noise_std=0.0)
+    action, _ = model.predict(obs, deterministic=True)
+    twist.linear.x  = (action[0] + 1) / 2 * max_linear_vel
+    twist.angular.z = action[1] * max_angular_vel
+    cmd_vel_pub.publish(twist)
+```
+
+### Runtime goal updates (no node restart)
 
 ```bash
-# Install Isaac Sim (Linux)
-# Download from NVIDIA Omniverse
-
-# Python API for training
-python3 -c "
-from omni.isaac.kit import SimulationApp
-simulation_app = SimulationApp()
-# Load scene, run training loop
-"
+ros2 topic pub /goal_xy std_msgs/msg/Float64MultiArray '{data: [3.0, 1.5]}'
 ```
 
-### Environment Scenarios for Training
+### Hardware safety override
 
-```python
-class ForestEnvironment:
-    """Gazebo simulation of forest navigation"""
-    
-    SCENARIOS = {
-        'sparse_trees': {'density': 0.1, 'obstacle_type': 'tree'},
-        'dense_forest': {'density': 0.4, 'obstacle_type': 'mixed'},
-        'rock_field': {'density': 0.3, 'obstacle_type': 'rock'},
-        'mixed_terrain': {'density': 0.25, 'obstacle_type': 'all'},
-        'narrow_passages': {'density': 0.2, 'corridor_width': 1.5},
-    }
-    
-    def __init__(self, scenario='dense_forest'):
-        self.scenario = scenario
-        self.generate_obstacles()
-    
-    def generate_obstacles(self):
-        """Procedurally generate obstacles"""
-        scenario = self.SCENARIOS[self.scenario]
-        density = scenario['density']
-        
-        # Place obstacles randomly
-        for _ in range(int(density * 100)):
-            x = np.random.uniform(-10, 10)
-            y = np.random.uniform(-10, 10)
-            # Spawn in Gazebo
-```
+`bts7960_driver.py` subscribes to `/scan` independently. If any range falls below
+`scan_min_dist` (0.15 m), all PWM outputs are set to zero immediately, overriding
+any policy command. This layer is independent of the learned policy.
 
 ---
 
-## 6. Reward Function Design (Critical!)
+## 13. Evaluation Methodology
 
-### Reward Components
-
-```python
-def compute_reward(state, action, next_state, done, goal):
-    """
-    Comprehensive reward function for forest navigation
-    
-    Challenge: Reward shaping is critical for DRL success
-    Poor reward → Poor learning
-    """
-    
-    reward = 0.0
-    
-    # 1. GOAL REWARD (Main objective)
-    distance_to_goal = np.linalg.norm(next_state['position'] - goal)
-    
-    # Dense reward: progress toward goal
-    distance_to_goal_prev = np.linalg.norm(state['position'] - goal)
-    progress_reward = (distance_to_goal_prev - distance_to_goal) * 10.0
-    reward += progress_reward
-    
-    # Sparse bonus: reached goal
-    if distance_to_goal < 0.3:  # 30cm threshold
-        reward += 100.0
-        done = True
-    
-    # 2. COLLISION PENALTY (Safety)
-    if next_state['collision']:
-        reward -= 50.0  # Hard penalty for collision
-        done = True
-    
-    # Discourge getting too close to obstacles
-    min_obstacle_distance = next_state['min_distance_to_obstacle']
-    if min_obstacle_distance < 0.5:
-        reward -= 10.0 * (0.5 - min_obstacle_distance)
-    
-    # 3. ACTION REGULARIZATION (Efficiency)
-    # Penalize large/jerky actions
-    action_magnitude = np.linalg.norm(action)
-    reward -= 0.01 * action_magnitude
-    
-    # Penalize excessive turning (encourages straight paths)
-    angular_velocity = action[1]
-    reward -= 0.02 * abs(angular_velocity)
-    
-    # 4. SURVIVAL REWARD (Encourages exploration)
-    # Small reward for each step without collision
-    reward += 0.1
-    
-    # 5. EFFICIENCY (Time penalty)
-    # Encourages fast, direct paths
-    reward -= 0.01
-    
-    # 6. DIRECTION BONUS (Heuristic guidance)
-    # Reward facing toward goal
-    direction_to_goal = np.arctan2(
-        goal[1] - next_state['position'][1],
-        goal[0] - next_state['position'][0]
-    )
-    robot_heading = next_state['orientation']
-    angle_error = abs(np.degrees(direction_to_goal - robot_heading))
-    if angle_error < 45:  # Facing general direction of goal
-        reward += 0.5
-    
-    return reward, done
-```
-
-### Reward Tuning Guidelines
-
-| Component | Weight | Rationale |
-|-----------|--------|-----------|
-| **Goal progress** | High (10×) | Primary objective |
-| **Collision penalty** | Highest (-50) | Safety critical |
-| **Obstacle proximity** | High (-10×dist) | Prevent near-collisions |
-| **Action regularization** | Low (-0.01) | Encourage efficiency |
-| **Survival bonus** | Low (+0.1) | Exploration encouragement |
-
-**Common Reward Mistakes:**
-- ❌ Too-small goal reward → Agent doesn't learn to reach goal
-- ❌ Too-large collision penalty → Agent gets stuck in conservative behavior
-- ❌ Missing obstacle proximity penalty → Collision rate high
-- ❌ Imbalanced action regularization → Jerky or stuck movements
-
----
-
-## 7. Training Pipeline & Sample Efficiency
-
-### Complete Training Loop (PPO)
-
-```python
-import numpy as np
-import torch
-import torch.nn.functional as F
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-
-class ForestNavigationTraining:
-    def __init__(self, env_name='TurtleBot3-Forest-v0', num_envs=4, device='cuda'):
-        # Vectorized environments for parallel training
-        self.env = make_vec_env(env_name, n_envs=num_envs, seed=0)
-        self.device = device
-        
-        # PPO algorithm
-        self.model = PPO(
-            'MlpPolicy',
-            self.env,
-            learning_rate=3e-4,
-            n_steps=2048,           # Collect 2048 steps before update
-            batch_size=64,          # Process in batches of 64
-            n_epochs=10,            # Multiple passes over data
-            gamma=0.99,             # Discount factor
-            gae_lambda=0.95,        # GAE advantage coefficient
-            clip_range=0.2,         # PPO clip parameter
-            clip_range_vf=None,     # Value function clipping
-            ent_coef=0.01,          # Entropy coefficient (exploration)
-            use_sde=False,          # State-dependent exploration
-            device=self.device,
-            verbose=1,
-            tensorboard_log='./logs/',
-        )
-    
-    def train(self, total_timesteps=1e6, checkpoint_freq=1000):
-        """Train for specified number of steps"""
-        self.model.learn(
-            total_timesteps=int(total_timesteps),
-            callback=self.create_callbacks(),
-            tb_log_name='forest_nav'
-        )
-    
-    def create_callbacks(self):
-        """Monitoring and checkpointing"""
-        from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-        
-        checkpoint_callback = CheckpointCallback(
-            save_freq=50000,
-            save_path='./models/',
-            name_prefix='forest_nav'
-        )
-        
-        eval_callback = EvalCallback(
-            eval_env=self.env,
-            best_model_save_path='./models/best_model/',
-            log_path='./logs/',
-            eval_freq=25000,
-            deterministic=True,
-            render=False
-        )
-        
-        return [checkpoint_callback, eval_callback]
-    
-    def save_model(self, path):
-        self.model.save(path)
-        print(f"Model saved to {path}")
-
-# Training execution
-training = ForestNavigationTraining(num_envs=4)
-training.train(total_timesteps=2e6)  # 2 million steps ~ 6–10 hours on RTX 4050
-training.save_model('./models/forest_nav_final.zip')
-```
-
-### Approximate Training Times (RTX 4050)
-
-| Task | Timesteps | Time | Success Rate |
-|------|-----------|------|--------------|
-| Simple obstacle avoidance | 100K | 30 min | 70–80% |
-| Point-to-point navigation | 500K | 2–3 hours | 75–85% |
-| Forest navigation (complex) | 1–2M | 4–8 hours | 80–90% |
-| Curriculum + Augmentation | 2–4M | 10–16 hours | 90%+ |
-
----
-
-## 8. Scenario Augmentation for Generalization
-
-### Problem: Overfitting to Training Environments
-- Policy trained only in sparse forest → fails in dense forest
-- Policy trained only on flat terrain → crashes on slopes
-- Policy trained in daylight → fails at night
-
-### Solution: Domain Randomization
-
-```python
-import gymnasium as gym
-from gymnasium import spaces
-
-class DomainRandomizationEnv(gym.Wrapper):
-    """Randomly vary environment parameters during training"""
-    
-    def __init__(self, env):
-        super().__init__(env)
-        self.randomization_active = True
-    
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        
-        if self.randomization_active:
-            self.apply_domain_randomization()
-        
-        return obs, info
-    
-    def apply_domain_randomization(self):
-        """Vary: terrain, obstacles, lighting, robot dynamics, sensor noise"""
-        
-        # 1. TERRAIN RANDOMIZATION
-        terrain_types = ['grass', 'gravel', 'mud', 'asphalt', 'snow']
-        terrain = np.random.choice(terrain_types)
-        friction = np.random.uniform(0.3, 1.0)  # Friction coefficient
-        
-        # 2. OBSTACLE RANDOMIZATION
-        num_obstacles = np.random.randint(5, 30)  # 5–30 obstacles
-        obstacle_size = np.random.uniform(0.2, 1.0)  # 20–100cm
-        obstacle_type = np.random.choice(['tree', 'rock', 'wall'])
-        
-        # 3. SENSOR NOISE RANDOMIZATION
-        self.camera_noise = np.random.uniform(0, 0.05)  # 0–5% image noise
-        self.lidar_noise = np.random.uniform(0, 0.1)   # 0–10cm LIDAR noise
-        
-        # 4. ROBOT DYNAMICS RANDOMIZATION
-        max_speed = np.random.uniform(0.5, 1.5)  # 0.5–1.5 m/s max
-        accel_limit = np.random.uniform(0.2, 0.8)  # Acceleration limit
-        
-        # 5. LIGHTING RANDOMIZATION
-        brightness = np.random.uniform(0.5, 2.0)  # 50%–200% brightness
-        shadow_intensity = np.random.uniform(0, 1.0)
-        
-        # Apply to simulation
-        self.env.set_terrain(terrain, friction)
-        self.env.set_obstacles(num_obstacles, obstacle_size, obstacle_type)
-        self.env.set_sensor_noise(self.camera_noise, self.lidar_noise)
-        self.env.set_robot_dynamics(max_speed, accel_limit)
-        self.env.set_lighting(brightness, shadow_intensity)
-
-# Training with augmentation
-from gymnasium.wrappers import RecordVideo
-
-env = gym.make('TurtleBot3-Forest-v0')
-env = DomainRandomizationEnv(env)
-env = RecordVideo(env, video_folder='./videos/', episode_trigger=lambda x: x % 100 == 0)
-
-model = PPO('MlpPolicy', env)
-model.learn(total_timesteps=2e6)
-```
-
-### Augmentation Schedule
-```python
-# Start with no randomization, gradually increase complexity
-class CurriculumAugmentation:
-    def __init__(self, total_steps):
-        self.total_steps = total_steps
-        self.current_step = 0
-    
-    def get_augmentation_level(self):
-        """Increase difficulty over time"""
-        progress = self.current_step / self.total_steps
-        
-        if progress < 0.25:      # First 25%: Minimal randomization
-            return 0.1
-        elif progress < 0.50:    # Next 25%: Medium randomization
-            return 0.5
-        elif progress < 0.75:    # Next 25%: High randomization
-            return 0.8
-        else:                    # Last 25%: Maximum randomization
-            return 1.0
-    
-    def step(self):
-        self.current_step += 1
-```
-
----
-
-## 9. Sim-to-Real Transfer Strategy
-
-### The Sim-to-Real Gap Problem
-
-| Domain | Simulation | Real World |
-|--------|-----------|-----------|
-| **Friction** | Exact, uniform | Variable, uncertain |
-| **Lighting** | Controlled | Dynamic, shadows |
-| **Sensors** | Perfect, no noise | Noisy, latency |
-| **Motor response** | Instant | Delayed, non-linear |
-| **Physics** | Idealized | Complex dynamics |
-
-### Transfer Techniques
-
-#### Technique 1: Domain Randomization (Most Effective)
-```python
-# Train with high randomization → Policy robust to variations
-env = DomainRandomizationEnv(env)
-# Apply friction variation, lighting change, sensor noise, etc.
-model.learn(total_timesteps=2e6)
-# Policy becomes robust to real-world variations
-```
-
-#### Technique 2: System Identification
-```python
-# Learn robot's actual dynamics and adapt policy
-class SystemIdentifier:
-    def __init__(self):
-        self.dynamics_model = NeuralNetwork(...)  # Learn: action → actual_motion
-    
-    def identify_dynamics(self, real_robot_trajectories):
-        """Learn actual robot behavior from short real-world interaction"""
-        # Collect 100–200 trajectories on real robot
-        # Train neural network to predict motion
-        self.dynamics_model.fit(trajectories)
-    
-    def adapt_policy(self, policy):
-        """Adjust policy for identified dynamics"""
-        # Use identified model to predict policy performance
-        # Adjust policy to account for real dynamics
-```
-
-#### Technique 3: Privileged Information During Training
-```python
-# During sim training, use extra info not available in real-world
-class PrivilegedSimTraining:
-    def __init__(self):
-        pass
-    
-    def train_with_privileged_info(self, model, env):
-        """
-        During training: Use perfect state, sensor readings, etc.
-        At test-time (real robot): Use only camera + LIDAR
-        """
-        # Train policy to predict from partial observations
-        # During inference, policy still works with limited info
-```
-
----
-
-## 10. Real Robot Deployment on Your Rover
-
-### ROS2 Deployment Node
-
-```python
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import Image, LaserScan
-import cv_bridge
-import numpy as np
-import torch
-from stable_baselines3 import PPO
-
-class MaplessNavigationNode(Node):
-    def __init__(self):
-        super().__init__('mapless_navigation_node')
-        
-        # Load trained policy
-        self.policy = PPO.load('./models/forest_nav_final.zip')
-        self.policy.set_training_mode(False)  # Disable training
-        
-        # Subscribers
-        self.image_sub = self.create_subscription(
-            Image, '/camera/image', self.image_callback, 10)
-        self.lidar_sub = self.create_subscription(
-            LaserScan, '/scan', self.lidar_callback, 10)
-        
-        # Publisher
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # State storage
-        self.latest_image = None
-        self.latest_lidar = None
-        self.target_goal = np.array([10.0, 0.0])  # Goal coordinates
-        self.control_timer = self.create_timer(0.1, self.control_loop)  # 10Hz
-        
-        self.get_logger().info("Mapless Navigation Node Started")
-    
-    def image_callback(self, msg):
-        """Process incoming camera image"""
-        bridge = cv_bridge.CvBridge()
-        self.latest_image = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        # Resize and normalize
-        self.latest_image = cv2.resize(self.latest_image, (64, 64))
-        self.latest_image = self.latest_image.astype(np.float32) / 255.0
-    
-    def lidar_callback(self, msg):
-        """Process incoming LIDAR scan"""
-        # Convert LaserScan to range array
-        self.latest_lidar = np.array(msg.ranges)
-        # Clip inf values
-        self.latest_lidar = np.clip(self.latest_lidar, 0, 10)
-    
-    def control_loop(self):
-        """Main control loop: observe → predict action → execute"""
-        if self.latest_image is None or self.latest_lidar is None:
-            return
-        
-        # Construct observation
-        observation = self.construct_observation()
-        
-        # Predict action using policy
-        action, _ = self.policy.predict(observation, deterministic=True)
-        
-        # Execute action
-        self.execute_action(action)
-    
-    def construct_observation(self):
-        """Build observation vector for policy"""
-        # Flatten image (CNN processes this)
-        image_flat = self.latest_image.reshape(-1)
-        
-        # LIDAR scan (downsampled)
-        lidar_downsampled = self.latest_lidar[::4]  # Every 4th measurement
-        
-        # Goal position (relative to robot)
-        rel_goal = self.target_goal - self.get_robot_position()
-        goal_distance = np.linalg.norm(rel_goal)
-        goal_angle = np.arctan2(rel_goal[1], rel_goal[0])
-        
-        # Concatenate
-        observation = np.concatenate([
-            image_flat,
-            lidar_downsampled,
-            [goal_distance, goal_angle]
-        ]).astype(np.float32)
-        
-        return observation
-    
-    def execute_action(self, action):
-        """Convert policy action to ROS2 Twist command"""
-        twist = Twist()
-        twist.linear.x = float(action[0])   # Linear velocity
-        twist.angular.z = float(action[1])  # Angular velocity
-        
-        # Safety limits
-        twist.linear.x = np.clip(twist.linear.x, -0.5, 1.0)
-        twist.angular.z = np.clip(twist.angular.z, -1.0, 1.0)
-        
-        self.cmd_pub.publish(twist)
-    
-    def get_robot_position(self):
-        """Get robot's current position (from odometry or localization)"""
-        # Simplified: assume robot has localization
-        # In real deployment: subscribe to /odom topic
-        return np.array([0.0, 0.0])
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = MaplessNavigationNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
-```
-
-### Deployment Checklist
-- ✅ Policy trained and saved
-- ✅ ROS2 node created
-- ✅ Sensor topics configured
-- ✅ Motor control topics mapped
-- ✅ Safety limits set
-- ✅ Test in simulation first
-- ✅ Deploy on real rover
-
----
-
-## 11. Performance Benchmarks & Results (RTX 4050)
-
-### Training Performance
-
-| Metric | Value |
-|--------|-------|
-| **Timesteps/second** | 5K–8K steps/sec (4 parallel envs) |
-| **Time to 500K steps** | ~60–90 minutes |
-| **Time to 2M steps** | ~4–8 hours |
-| **GPU Memory Usage** | 4–5.5GB |
-| **CPU Utilization** | 30–40% |
-
-### Real-World Navigation Accuracy
-
-| Task | Success Rate | Avg Time | Notes |
-|------|-------------|----------|-------|
-| **Obstacle-free navigation** | 98%+ | 15–20s/50m | Trivial |
-| **Sparse obstacles (5–10)** | 92–95% | 20–25s | Easy |
-| **Dense forest simulation** | 85–92% | 25–35s | Medium |
-| **Real forest (unseen)** | 75–85% | 30–50s | Hard (sim-to-real gap) |
-| **Dynamic obstacles** | 80–88% | Variable | With people moving |
-
-### Collision Rates
-
-| Environment | Training Env | Unseen Env |
-|-------------|-------------|-----------|
-| **Sparse obstacles** | <1% | 2–5% |
-| **Dense forest** | 2–5% | 8–15% |
-| **Real world** | N/A | 5–20% |
-
----
-
-## 12. Integration with ROS2
-
-### ROS2 Launch File
-
-```xml
-<!-- mapless_navigation.launch.xml -->
-<launch>
-  <!-- Your rover's motor driver -->
-  <node pkg="rover_driver" exec="motor_node"/>
-  
-  <!-- Camera driver -->
-  <node pkg="usb_cam" exec="usb_cam_node" output="screen">
-    <param name="device_id" value="/dev/video0"/>
-    <param name="camera_info_url" value="file://$(find rover_calib)/camera.yaml"/>
-  </node>
-  
-  <!-- LIDAR driver -->
-  <node pkg="rplidar_ros" exec="rplidarNode" output="screen">
-    <param name="serial_port" value="/dev/ttyUSB0"/>
-  </node>
-  
-  <!-- Mapless Navigation Policy Node -->
-  <node pkg="mapless_navigation" exec="navigation_node" output="screen">
-    <param name="model_path" value="$(find mapless_navigation)/models/forest_nav_final.zip"/>
-    <param name="goal_x" value="10.0"/>
-    <param name="goal_y" value="0.0"/>
-    <param name="control_freq" value="10.0"/>
-  </node>
-  
-  <!-- RViz for visualization (optional) -->
-  <node pkg="rviz2" exec="rviz2" args="-d $(find mapless_navigation)/config/rover.rviz"/>
-</launch>
-```
-
-### ROS2 Topics
+### Running the benchmark
 
 ```bash
-# Subscriptions (inputs)
-/camera/image (sensor_msgs/Image)
-/scan (sensor_msgs/LaserScan)
-/odom (nav_msgs/Odometry)  [optional]
+# Terminal 1:
+ros2 launch mapless_navigation forest_sim.launch.xml
 
-# Publications (outputs)
-/cmd_vel (geometry_msgs/Twist)  [to motor controller]
-/navigation/status (std_msgs/String)
-/navigation/debug (sensor_msgs/PointCloud2)  [optional visualization]
+# Terminal 2:
+ros2 run mapless_navigation evaluate_policy --episodes 100
+```
+
+### Metrics
+
+| Metric | Description |
+|---|---|
+| **Success rate** | Episodes where `dist_to_goal < 0.5 m` before timeout |
+| **Collision rate** | Episodes where `min_lidar < 0.20 m` |
+| **Timeout rate** | Episodes reaching `max_steps = 500` without outcome |
+| **Avg steps** | Mean episode length |
+| **Avg final dist** | Mean distance to goal at episode end |
+
+### Ablation template
+
+```bash
+# Train both architectures
+ros2 run mapless_navigation train_ppo --policy conv1d  # default
+ros2 run mapless_navigation train_ppo --policy mlp
+
+# Evaluate both
+ros2 run mapless_navigation evaluate_policy --model models/ppo_forest_nav
+# (repeat with mlp model path)
+
+# Compare algorithms
+ros2 run mapless_navigation train_ppo --algorithm sac
+ros2 run mapless_navigation evaluate_policy --algorithm sac --model models/sac_forest_nav
 ```
 
 ---
 
-## 13. Advanced: Hierarchical RL, Meta-Learning, Curriculum Learning
+## 14. Configuration Reference
 
-### Hierarchical Reinforcement Learning (HRL)
-```python
-# Two-level policy: high-level (subgoal selection) + low-level (execution)
-class HierarchicalNavigationPolicy:
-    def __init__(self):
-        self.high_level_policy = HighLevelPolicy()  # Selects subgoals
-        self.low_level_policy = LowLevelPolicy()   # Executes actions
-    
-    def predict(self, observation):
-        # High-level: select next subgoal
-        subgoal = self.high_level_policy.predict(observation)
-        
-        # Low-level: navigate to subgoal
-        action = self.low_level_policy.predict(observation, subgoal)
-        
-        return action
-```
+### `config/training.yaml` — complete key list
 
-**Advantages:**
-- Faster learning (divide-and-conquer)
-- Better generalization (subgoals reusable)
-- Interpretable behavior (can see subgoal selection)
-
-### Meta-Learning (Learning to Learn)
-```python
-# Train policy to adapt quickly to new environments (5–10 shot)
-class MetaLearningForNavigation:
-    def __init__(self):
-        self.meta_learner = MetaLearner()  # Uses MAML or similar
-    
-    def meta_train(self, tasks):
-        # Tasks: different environments
-        for task in tasks:
-            self.meta_learner.update_on_task(task)
-    
-    def adapt_to_new_env(self, env_observations, num_steps=10):
-        """Quickly adapt policy to new environment"""
-        adapted_policy = self.meta_learner.adapt(env_observations, num_steps)
-        return adapted_policy
-```
-
-### Curriculum Learning
-```python
-# Gradually increase task difficulty
-class CurriculumNavigation:
-    def __init__(self):
-        self.current_level = 0
-        self.levels = [
-            {'obstacles': 5, 'terrain': 'flat'},
-            {'obstacles': 10, 'terrain': 'flat'},
-            {'obstacles': 20, 'terrain': 'varied'},
-            {'obstacles': 30, 'terrain': 'complex'},
-        ]
-    
-    def get_current_env(self):
-        return self.levels[min(self.current_level, len(self.levels)-1)]
-    
-    def advance_curriculum(self):
-        """Move to next difficulty level when succeeded"""
-        if self.current_success_rate > 0.85:
-            self.current_level += 1
-```
+| Key | Type | Description |
+|---|---|---|
+| `algorithm` | str | `"ppo"` or `"sac"` |
+| `total_timesteps` | int | Total environment steps |
+| `policy_type` | str | `"conv1d"` or `"mlp"` |
+| `conv_features_dim` | int | Conv1D extractor output dimension |
+| `env_config.max_range` | float | **Lidar max range — must match real sensor (12.0 m)** |
+| `env_config.collision_dist` | float | Collision threshold (m) |
+| `env_config.goal_reached_dist` | float | Success threshold (m) |
+| `env_config.proximity_penalty_dist` | float | Wall-hugging penalty activation (m) |
+| `env_config.proximity_penalty_weight` | float | Wall-hugging penalty scale |
+| `env_config.angular_penalty_weight` | float | Turn smoothness penalty scale |
+| `env_config.max_steps` | int | Episode truncation |
+| `env_config.domain_rand.lidar_noise_std` | float | Max lidar noise σ (m) |
+| `env_config.domain_rand.speed_scale_min/max` | float | Motor speed variation range |
+| `eval_freq` | int | Steps between EvalCallback runs |
+| `checkpoint_freq` | int | Steps between checkpoint saves |
 
 ---
 
-## 14. Troubleshooting & Optimization
+## 15. Known Limitations and Future Work
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| **Policy won't learn (flat loss)** | Poor reward shaping | Verify reward function, test with simple env |
-| **High collision rate** | Insufficient obstacle data | Increase domain randomization, more training |
-| **Slow inference (<10Hz)** | Model too large | Use distilled policy or MobileNet backbone |
-| **Generalization fails** | Overfit to training env | Increase domain randomization, add curriculum |
-| **Unstable behavior (jittering)** | Action not smoothed | Add temporal filtering or larger action clipping |
-| **Real robot diverges from sim** | Large sim-to-real gap | Use system identification, more randomization |
+### Known limitations
 
----
+**1. Unsynchronised Gazebo stepping**
+`ForestEnv.step()` sleeps 50 ms after publishing a command. This is not synchronised
+with Gazebo's physics tick. Proper synchronisation via `/world/default/control` would
+give more accurate training.
 
-## 15. References & Further Reading
+**2. Odometry drift on long missions**
+Goal coordinates are in the odometry frame, which drifts over time. For missions
+beyond ~20 m from the start point, fiducial re-localisation is needed.
 
-- [PPO: Proximal Policy Optimization (OpenAI)][190]
-- [Deep RL for Mapless Navigation (Cardiff PhD)][185]
-- [End-to-End Autonomous Navigation with DRL][186]
-- [Vision-Based DRL Navigation][187]
-- [Zero-Shot Out-of-Distribution Transfer][189]
-- [Hierarchical RL for Navigation][194]
-- [Domain Randomization for Sim-to-Real][98]
-- [TensorBoard logging for training monitoring]
-- [Gazebo simulation and TurtleBot3 integration]
-- [Stable-Baselines3 documentation]
+**3. No reverse motion**
+The action space maps to forward-only linear velocity. In very tight spaces the
+robot may get stuck where reversing would be optimal.
 
----
+**4. Camera unused**
+The Pi HQ Camera is mounted but not integrated into the policy or goal interface.
 
-## Summary: Your Complete Mapless Navigation System
+### Future work (priority order)
 
-| Stage | Component | Your RTX 4050 | Status |
-|-------|-----------|--|------|
-| **Simulation** | Gazebo + TurtleBot3 | Run at 30Hz+ | ✅ Ready |
-| **Training** | PPO algorithm | 5–8K steps/sec | ✅ Fast |
-| **Reward** | Designed function | Custom tuning | ✅ Flexible |
-| **Augmentation** | Domain randomization | All parameters | ✅ Robust |
-| **Inference** | Policy execution | 10Hz on rover | ✅ Real-time |
-| **Deployment** | ROS2 integration | Full pipeline | ✅ Production |
-| **Transfer** | Sim-to-real | Zero-shot capable | ✅ Proven |
-
----
-
-**You now have a complete end-to-end framework for autonomous forest navigation with your rover. Train in simulation, deploy to real hardware, and watch your robot explore without maps!**
-
-**For additional support, check official repositories (Stable-Baselines3, Gazebo, ROS2 Humble documentation) or experiment with variations on reward functions and augmentation strategies.**
-
-🚀 **Ready to launch your mapless navigation rover!**
+1. **Real deployment + video** — highest impact for CV/interviews.
+2. **Ablation table** — run Conv1D vs MLP, PPO vs SAC; fill in numbers from `evaluate_policy`.
+3. **Visual goal specification** — use Pi HQ Camera to detect ArUco markers; replace
+   hardcoded coordinates with camera-computed relative pose.
+4. **Isaac Lab migration** — port to NVIDIA Isaac Lab for massively parallel training.
+5. **SAC convergence comparison** — reward curves and success rate vs. PPO.

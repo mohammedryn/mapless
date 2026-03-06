@@ -1,24 +1,61 @@
-# Rover Physical Parameters
-robot_radius: 0.22  # meters (TurtleBot3 Waffle Pi)
-max_linear_vel: 0.26
-max_angular_vel: 1.82
-min_linear_vel: -0.26
-min_angular_vel: -1.82
+# Rover Physical Parameters — JGB37 4WD on Raspberry Pi 5
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Safety
-safety_margin: 0.05
-scan_min_dist: 0.15
+# ── Robot Geometry ─────────────────────────────────────────────────────────────
+robot_radius: 0.20          # metres — approximate chassis half-width
+track_width:  0.24          # metres — wheel-to-wheel separation (for reference)
 
-# Sensor
-lidar_fov: 360  # degrees
-lidar_samples: 360
+# ── Velocity Limits ───────────────────────────────────────────────────────────
+# Tuned conservatively for indoor/lab deployment.
+# Increase max_linear_vel for outdoor use once sim-to-real is validated.
+max_linear_vel:  0.26       # m/s  (forward)
+min_linear_vel:  0.0        # m/s  (no reverse in current policy)
+max_angular_vel: 1.82       # rad/s
+min_angular_vel: -1.82      # rad/s
 
-# BTS7960 GPIO Pins (Raspberry Pi Setup)
-left_l_en: 22
-left_r_en: 23
+# ── Safety ────────────────────────────────────────────────────────────────────
+safety_margin:  0.05        # metres — added buffer on collision check
+scan_min_dist:  0.15        # metres — hardware emergency-stop threshold
+                            #          (bts7960_driver and sabertooth_driver)
+
+# ── Lidar — Slamtec C1M1 R2 (DTOF, 360°) ─────────────────────────────────────
+lidar_fov:         360      # degrees
+lidar_samples:     360      # samples per revolution used by the policy
+lidar_max_range:   12.0     # metres — C1M1 R2 datasheet maximum range
+lidar_min_range:   0.05     # metres — C1M1 R2 blind-zone specification
+lidar_frame_id:    "laser"
+lidar_serial_port: "/dev/ttyUSB0"
+lidar_baudrate:    115200
+
+# ── IMU — MPU-6050 (I2C) ─────────────────────────────────────────────────────
+# The MPU-6050 provides 3-axis gyro + 3-axis accelerometer over I2C.
+# Its /imu/data output is fused with rf2o scan-matching odometry by the
+# robot_localization EKF node (see config/ekf.yaml) to produce
+# /odometry/filtered — a more robust pose estimate on slippery floors and
+# during fast turns where lidar-only odometry tends to drift.
+imu_frame_id:      "imu_link"
+imu_i2c_addr:      "0x68"   # default MPU-6050 address (AD0 pulled low)
+imu_topic:         "/imu/data"
+
+# ── Camera — Raspberry Pi HQ Camera (IMX477) ─────────────────────────────────
+camera_topic:      "/camera/image_raw"
+camera_width:      640
+camera_height:     480
+camera_fps:        30
+
+# ── BTS7960 GPIO Pins — Raspberry Pi 5 ───────────────────────────────────────
+# Verify against your actual wiring before first power-on.
+left_l_en:  22
+left_r_en:  23
 left_l_pwm: 18
 left_r_pwm: 19
-right_l_en: 17
-right_r_en: 27
+right_l_en:  17
+right_r_en:  27
 right_l_pwm: 12
 right_r_pwm: 13
+
+# ── TF Frames ─────────────────────────────────────────────────────────────────
+# Static transform published by real_robot.launch.py:
+#   base_link → laser  (adjust to actual lidar mounting position)
+laser_offset_x: 0.10   # metres forward from base_link origin
+laser_offset_z: 0.20   # metres above base_link origin

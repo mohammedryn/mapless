@@ -2,18 +2,36 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>mapless_navigation</name>
-  <version>0.0.1</version>
-  <description>Mapless DRL Forest Navigation using PPO</description>
-  <maintainer email="user@example.com">User</maintainer>
-  <license>TODO: License declaration</license>
+  <version>0.2.0</version>
+  <description>
+    Mapless DRL navigation for a 4WD rover using PPO/SAC + Stable Baselines 3.
+    Trains in Gazebo Harmonic simulation and deploys on a Raspberry Pi 5 with
+    a Slamtec C1M1 R2 lidar, MPU-6050 IMU, and BTS7960 motor drivers.
+  </description>
+  <maintainer email="mohammedryn@gmail.com">Mohammed Rayan</maintainer>
+  <license>MIT</license>
 
+  <!-- Core ROS 2 runtime deps -->
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
-  <exec_depend>turtlebot3_gazebo</exec_depend>
-  <exec_depend>python3-gpiozero</exec_depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
 
+  <!-- Simulation -->
+  <exec_depend>turtlebot3_gazebo</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+
+  <!-- Hardware drivers -->
+  <exec_depend>python3-gpiozero</exec_depend>
+  <exec_depend>sllidar_ros2</exec_depend>
+  <exec_depend>rf2o_laser_odometry</exec_depend>
+
+  <!-- IMU + sensor fusion -->
+  <exec_depend>robot_localization</exec_depend>
+
+  <!-- Linting / tests -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

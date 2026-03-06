@@ -1,6 +1,15 @@
-# PPO Training Configuration
+# PPO / SAC Training Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# All hyperparameters are read directly by train_ppo.py — no magic numbers
+# scattered across source files.
+
+# ── Algorithm ─────────────────────────────────────────────────────────────────
+algorithm: "ppo"          # "ppo" | "sac"
+
 total_timesteps: 2000000
 learning_rate: 0.0003
+
+# PPO-specific
 n_steps: 2048
 batch_size: 64
 n_epochs: 10
@@ -11,14 +20,58 @@ ent_coef: 0.005
 vf_coef: 0.5
 max_grad_norm: 0.5
 
-# Environment Configuration
+# ── Policy Architecture ────────────────────────────────────────────────────────
+# "mlp"    — flat MlpPolicy (baseline, all 362 inputs treated equally)
+# "conv1d" — custom 1-D convolutional extractor that treats the 360 lidar rays
+#             as a circular signal before concatenating the 2 goal features.
+#             Exploits spatial structure; converges faster than flat MLP.
+policy_type: "conv1d"
+conv_features_dim: 256    # Output dimension of the Conv1D feature extractor
+
+# ── Environment Configuration ─────────────────────────────────────────────────
 env_config:
-  scan_topic: "/scan"
+  scan_topic:    "/scan"
   cmd_vel_topic: "/cmd_vel"
-  odom_topic: "/odom"
+  odom_topic:    "/odom"
+
   lidar_ranges: 360
+  # IMPORTANT: Must match the real sensor's maximum range.
+  # Slamtec C1M1 R2 datasheet value = 12.0 m (DTOF technology).
+  # Previous value was 3.5 m (RPLIDAR A1 simulation value).
+  # Using the wrong constant causes all readings above 3.5 m to saturate at 1.0,
+  # creating a sim-to-real observation mismatch on the real hardware.
+  max_range: 12.0
   min_range: 0.12
-  max_range: 3.5
-  goal_distance_reward_weight: 1.0
-  collision_penalty: 100.0
+
+  # Collision / goal thresholds
+  collision_dist:      0.20   # metres — episode terminates on collision
+  collision_penalty:   100.0
+  goal_reached_dist:   0.50   # metres — episode terminates on success
   goal_reached_reward: 100.0
+
+  # Proximity penalty: discourages hugging walls even without triggering collision.
+  # reward -= proximity_penalty_weight * max(0, proximity_penalty_dist - min_laser)
+  proximity_penalty_dist:   0.50   # metres
+  proximity_penalty_weight: 5.0
+
+  # Angular velocity penalty: encourages smoother, straighter paths.
+  angular_penalty_weight: 0.05
+
+  max_steps: 500   # Episode hard-truncation limit
+
+  # ── Domain Randomisation ────────────────────────────────────────────────────
+  # Applied at each env.reset() to improve sim-to-real robustness.
+  # Set std to 0.0 and scale values to 1.0 to disable for a clean baseline run.
+  domain_rand:
+    lidar_noise_std:  0.03    # Gaussian noise sigma on range readings (metres)
+    speed_scale_min:  0.85    # Random linear-speed scale drawn from
+    speed_scale_max:  1.15    #   Uniform(speed_scale_min, speed_scale_max)
+
+  # ── Goal Spawn Region ──────────────────────────────────────────────────────
+  goal_x_range: [2.0, 8.0]
+  goal_y_range: [-3.0, 3.0]
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+eval_freq:        25000   # Steps between EvalCallback evaluations
+eval_episodes:    20      # Episodes per evaluation run
+checkpoint_freq:  50000   # Steps between CheckpointCallback saves

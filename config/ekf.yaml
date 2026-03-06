@@ -1,0 +1,77 @@
+# robot_localization EKF configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Fuses two odometry sources:
+#   1. /odom          — rf2o lidar scan-matching (reliable in feature-rich areas,
+#                        drifts in featureless corridors and fast rotations)
+#   2. /imu/data      — MPU-6050 IMU (3-axis gyro + 3-axis accel via I2C)
+#
+# Output: /odometry/filtered — used by NavigationNode as the primary pose source.
+#
+# Tuning notes:
+#   - process_noise_covariance diagonal values control how quickly the filter
+#     forgets its current estimate.  Increase if the robot moves aggressively.
+#   - Reduce odom0_config vz/vroll/vpitch to false if rf2o drifts vertically.
+#   - imu0_remove_gravitational_acceleration must be true or z-accel will be
+#     dominated by the 9.8 m/s^2 gravity component.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.1
+    two_d_mode: true          # 2-D planar robot assumption
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+
+    map_frame:       "map"
+    odom_frame:      "odom"
+    base_link_frame: "base_link"
+    world_frame:     "odom"
+
+    # ── Odometry source 0: rf2o lidar scan-matching ────────────────────────
+    odom0: "/odom"
+    # State vector: [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az]
+    odom0_config: [true,  true,  false,
+                   false, false, true,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative:     false
+    odom0_queue_size:   5
+
+    # ── IMU source 0: MPU-6050 ─────────────────────────────────────────────
+    # Fuses: yaw orientation, yaw angular rate, forward/lateral linear accel.
+    imu0: "/imu/data"
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  true,  true,  false]
+    imu0_differential: false
+    imu0_relative:     false
+    imu0_queue_size:   10
+    imu0_remove_gravitational_acceleration: true
+
+    # ── Process noise covariance (15x15, row-major) ────────────────────────
+    # Diagonal values only shown; off-diagonal zeros omitted for readability.
+    # Format required by robot_localization as a flat 225-element list:
+    process_noise_covariance: [
+      0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0.03, 0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0.03, 0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0.06, 0,     0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0.025, 0,     0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0.025, 0,    0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0.04, 0,    0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0.01, 0,    0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0.01, 0,    0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0.02, 0,    0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0.01, 0,    0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0.01, 0,
+      0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0.015
+    ]

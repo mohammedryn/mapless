@@ -2,254 +2,248 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist, TwistStamped
-from nav_msgs.msg import Odometry
+import os
+import subprocess
 import time
-import math
+import yaml
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from std_srvs.srv import Empty
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import TwistStamped
+from nav_msgs.msg import Odometry
+
+from mapless_navigation import obs_utils
+
 
 class ForestEnv(gym.Env):
-    """
-    Custom Environment that follows gym interface.
-    """
-    def __init__(self, config_path=None):
-        super(ForestEnv, self).__init__()
+    """Gymnasium environment for DRL training in Gazebo Harmonic simulation.
 
-        # Initialize ROS2
+    Observation (362-dimensional float32):
+        [0..359]  Lidar ranges normalised by LIDAR_MAX_RANGE (C1M1 R2 = 12 m)
+        [360]     Normalised distance to goal in [0, 1]
+        [361]     Normalised bearing to goal in [-1, 1]
+
+    Action (2-dimensional float32 in [-1, 1]):
+        [0] → linear velocity   mapped to [0, max_linear_vel] m/s
+        [1] → angular velocity  mapped to [-max_angular_vel, max_angular_vel] rad/s
+
+    Domain randomisation (per episode, applied at reset()):
+        - Gaussian lidar noise to bridge the sim-to-real sensor gap.
+        - Random linear-speed scale to account for motor-to-motor variation
+          and battery voltage sag on the real JGB37 motors.
+    """
+
+    def __init__(self, config_path=None):
+        super().__init__()
+
         if not rclpy.ok():
             rclpy.init()
-        
+
         self.node = rclpy.create_node('forest_env_node')
-        
-        # QoS for LaserScan
-        qos_profile = QoSProfile(
+
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=1,
         )
-
-        # Subscribers and Publishers
         self.scan_sub = self.node.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            qos_profile
-        )
+            LaserScan, '/scan', self._scan_cb, qos)
         self.odom_sub = self.node.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
+            Odometry, '/odom', self._odom_cb, 10)
         self.cmd_vel_pub = self.node.create_publisher(TwistStamped, '/cmd_vel', 10)
-        
-        # No need for reset_client, will use subprocess to reset Gazebo directly
 
-        # Action space: [linear_vel, angular_vel]
-        # Normalized action space [-1, 1]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-
-        # Observation space: LaserScan ranges (normalized) + Goal info (distance, angle)
-        # Assuming 360 scan points
-        self.n_scan = 360
-        low = np.zeros(self.n_scan + 2)
-        low[-1] = -1.0 # Angle can be negative
-        
+        # ── Spaces ────────────────────────────────────────────────────────────
+        n_obs = obs_utils.N_SCAN + 2
+        obs_low        = np.zeros(n_obs, dtype=np.float32)
+        obs_low[-1]    = -1.0          # bearing can be negative
         self.observation_space = spaces.Box(
-            low=low, 
-            high=1.0, 
-            shape=(self.n_scan + 2,), # Scan + Goal Dist + Goal Angle
-            dtype=np.float32
-        )
+            low=obs_low, high=1.0, shape=(n_obs,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        self.scan_data = np.ones(self.n_scan) * 3.5 # Default max range
-        self.current_odom = None
-        self.goal_x = 5.0 # Example goal
-        self.goal_y = 0.0
-        self.step_count = 0
-        self.max_steps = 500  # Truncate episodes to prevent infinite loops
-        
-        import yaml
-        import os
-        from ament_index_python.packages import get_package_share_directory
+        # ── State ─────────────────────────────────────────────────────────────
+        self.raw_scan_data = np.full(obs_utils.N_SCAN, obs_utils.LIDAR_MAX_RANGE)
+        self.current_odom  = None
+        self.goal_x        = 5.0
+        self.goal_y        = 0.0
+        self.step_count    = 0
+        self.prev_distance = 0.0
+        # Per-episode domain randomisation values (updated in reset())
+        self.lidar_noise_std = 0.0
+        self.speed_scale     = 1.0
 
-        # Load configuration
+        self._load_config()
+
+    # ─────────────────────────────────────────── config loading ──────────────
+
+    def _load_config(self):
         try:
-            pkg_share = get_package_share_directory('mapless_navigation')
-            rover_config_path = os.path.join(pkg_share, 'config', 'rover.yaml')
-            training_config_path = os.path.join(pkg_share, 'config', 'training.yaml')
+            from ament_index_python.packages import get_package_share_directory
+            pkg = get_package_share_directory('mapless_navigation')
+            with open(os.path.join(pkg, 'config', 'rover.yaml')) as f:
+                rover = yaml.safe_load(f)
+            with open(os.path.join(pkg, 'config', 'training.yaml')) as f:
+                train = yaml.safe_load(f)
 
-            with open(rover_config_path, 'r') as f:
-                rover_config = yaml.safe_load(f)
-            with open(training_config_path, 'r') as f:
-                training_config = yaml.safe_load(f)
-                env_config = training_config.get('env_config', {})
+            ec = train.get('env_config', {})
+            dr = ec.get('domain_rand', {})
 
-            self.max_linear_vel = float(rover_config.get('max_linear_vel', 0.26))
-            self.max_angular_vel = float(rover_config.get('max_angular_vel', 1.82))
-            
-            self.collision_dist = float(env_config.get('collision_penalty_dist', 0.20)) # Using a sensible name or fallback
-            self.collision_penalty = float(env_config.get('collision_penalty', 100.0))
-            self.goal_reached_reward = float(env_config.get('goal_reached_reward', 100.0))
-            
+            self.max_linear_vel       = float(rover.get('max_linear_vel',  0.26))
+            self.max_angular_vel      = float(rover.get('max_angular_vel', 1.82))
+            self.collision_dist       = float(ec.get('collision_dist',       0.20))
+            self.collision_penalty    = float(ec.get('collision_penalty',   100.0))
+            self.goal_reached_dist    = float(ec.get('goal_reached_dist',    0.50))
+            self.goal_reached_reward  = float(ec.get('goal_reached_reward', 100.0))
+            self.prox_dist            = float(ec.get('proximity_penalty_dist',   0.50))
+            self.prox_weight          = float(ec.get('proximity_penalty_weight', 5.0))
+            self.ang_penalty_weight   = float(ec.get('angular_penalty_weight',   0.05))
+            self.max_steps            = int(ec.get('max_steps', 500))
+            self.goal_x_range         = ec.get('goal_x_range', [2.0, 8.0])
+            self.goal_y_range         = ec.get('goal_y_range', [-3.0, 3.0])
+            self.dr_noise_std         = float(dr.get('lidar_noise_std',  0.03))
+            self.dr_speed_min         = float(dr.get('speed_scale_min',  0.85))
+            self.dr_speed_max         = float(dr.get('speed_scale_max',  1.15))
+
         except Exception as e:
-            # Fallback to defaults if config loading fails
-            self.node.get_logger().error(f"Failed to load config, using defaults: {e}")
-            self.max_linear_vel = 0.26
-            self.max_angular_vel = 1.82
-            self.collision_dist = 0.20
-            self.collision_penalty = 100.0
-            self.goal_reached_reward = 100.0
+            self.node.get_logger().error(f"Config load failed, using defaults: {e}")
+            self.max_linear_vel = 0.26;   self.max_angular_vel = 1.82
+            self.collision_dist = 0.20;   self.collision_penalty = 100.0
+            self.goal_reached_dist = 0.50; self.goal_reached_reward = 100.0
+            self.prox_dist = 0.50;        self.prox_weight = 5.0
+            self.ang_penalty_weight = 0.05
+            self.max_steps = 500
+            self.goal_x_range = [2.0, 8.0]; self.goal_y_range = [-3.0, 3.0]
+            self.dr_noise_std = 0.03
+            self.dr_speed_min = 0.85;     self.dr_speed_max = 1.15
 
-    def scan_callback(self, msg):
-        # Process scan data: take 360 points, handle infs
-        ranges = np.array(msg.ranges)
-        # Resize or sample to match n_scan if needed. Assuming msg.ranges is large enough.
-        # Simple downsampling or taking first 360 if it matches
-        if len(ranges) >= self.n_scan:
-            step = len(ranges) // self.n_scan
-            self.scan_data = ranges[::step][:self.n_scan]
-        else:
-            # Pad if too small (unlikely for LIDAR)
-            self.scan_data = np.pad(ranges, (0, self.n_scan - len(ranges)), 'constant', constant_values=3.5)
-        
-        # Replace inf/nan
-        self.scan_data = np.nan_to_num(self.scan_data, nan=3.5, posinf=3.5, neginf=0.0)
-        self.scan_data = np.clip(self.scan_data, 0.0, 3.5)
+    # ─────────────────────────────────────────── ROS 2 callbacks ─────────────
 
-    def odom_callback(self, msg):
+    def _scan_cb(self, msg):
+        """Store raw range data (no processing here — obs_utils handles it)."""
+        self.raw_scan_data = np.array(msg.ranges, dtype=np.float64)
+
+    def _odom_cb(self, msg):
         self.current_odom = msg
 
-    def step(self, action):
-        # Spin ROS to get latest messages
-        rclpy.spin_once(self.node, timeout_sec=0.0)
+    # ─────────────────────────────────────────── Gymnasium API ───────────────
 
+    def step(self, action):
+        rclpy.spin_once(self.node, timeout_sec=0.0)
         self.step_count += 1
 
-        # Execute action
-        linear_vel = (action[0] + 1.0) / 2.0 * self.max_linear_vel # Map [-1, 1] to [0, max]
+        # Speed scale applies only to linear; angular is kept constant
+        # (turning radius is a geometric property, not a speed constraint).
+        linear_vel  = (action[0] + 1.0) / 2.0 * self.max_linear_vel * self.speed_scale
         angular_vel = action[1] * self.max_angular_vel
 
-        msg = TwistStamped()
-        msg.twist.linear.x = float(linear_vel)
-        msg.twist.angular.z = float(angular_vel)
-        self.cmd_vel_pub.publish(msg)
+        cmd = TwistStamped()
+        cmd.twist.linear.x  = float(linear_vel)
+        cmd.twist.angular.z = float(angular_vel)
+        self.cmd_vel_pub.publish(cmd)
 
-        # Wait a bit for action to take effect (simple simulation step)
-        # In real training, this might need better synchronization
-        time.sleep(0.05) 
+        time.sleep(0.05)
 
-        # Get observation
-        obs = self._get_obs()
+        obs, raw_dist = self._get_obs()
+        reward, done  = self._calculate_reward(raw_dist, action)
+        truncated     = self.step_count >= self.max_steps
 
-        # Calculate reward
-        reward, done = self._calculate_reward(obs)
-        
-        # Check episode truncation (max steps exceeded)
-        truncated = self.step_count >= self.max_steps
-        
-        info = {}
-        
-        return obs, reward, done, truncated, info
+        return obs, reward, done, truncated, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        # Reset robot (in simulation this might involve a service call to Gazebo)
-        # For now, we just stop the robot
-        msg = TwistStamped()
-        self.cmd_vel_pub.publish(msg)
 
-        self.step_count = 0  # Reset step counter
+        self.cmd_vel_pub.publish(TwistStamped())   # stop robot
+        self.step_count = 0
 
-        # Reset robot position near edge of maze (close to walls for faster learning)
-        import subprocess
+        # ── Sample domain randomisation for this episode ──────────────────────
+        # Lidar noise: random σ in [0, dr_noise_std] — teaches policy to be
+        # robust to sensor imprecision.
+        self.lidar_noise_std = float(np.random.uniform(0.0, self.dr_noise_std))
+        # Speed scale: random factor in [dr_speed_min, dr_speed_max] — mimics
+        # battery-level and motor-load variation on the real robot.
+        self.speed_scale = float(np.random.uniform(self.dr_speed_min, self.dr_speed_max))
+
+        # Randomise goal position.
+        self.goal_x = float(np.random.uniform(*self.goal_x_range))
+        self.goal_y = float(np.random.uniform(*self.goal_y_range))
+
+        # Teleport robot back to spawn in Gazebo Harmonic.
         try:
-            req_str = 'name: "burger", position: {x: -2.0, y: -0.5, z: 0.05}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
-            subprocess.run(["gz", "service", "-s", "/world/default/set_pose", 
-                            "--reqtype", "gz.msgs.Pose", "--reptype", "gz.msgs.Boolean", 
-                            "--timeout", "2000", "--req", req_str],
-                           check=True, capture_output=True, timeout=3)
+            req = ('name: "burger", '
+                   'position: {x: -2.0, y: -0.5, z: 0.05}, '
+                   'orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}')
+            subprocess.run(
+                ['gz', 'service', '-s', '/world/default/set_pose',
+                 '--reqtype', 'gz.msgs.Pose', '--reptype', 'gz.msgs.Boolean',
+                 '--timeout', '2000', '--req', req],
+                check=True, capture_output=True, timeout=3,
+            )
         except subprocess.TimeoutExpired:
             self.node.get_logger().warn('set_pose timed out, continuing anyway')
         except subprocess.CalledProcessError as e:
-            self.node.get_logger().error(f'Failed to reset robot pose: {e.stderr}')
-        
-        # Randomize goal
-        self.goal_x = np.random.uniform(2.0, 8.0)
-        self.goal_y = np.random.uniform(-3.0, 3.0)
-        
-        # Reset scan data to safe values to avoid immediate collision detection from stale data
-        self.scan_data = np.ones(self.n_scan) * 3.5
-        
-        # Wait for fresh observation
-        # Give Gazebo time to physically reset the robot and publish new scans
+            self.node.get_logger().error(f'set_pose failed: {e.stderr}')
+
+        # Flush stale scan data so we don't trigger an immediate collision
+        # on the first step with data from the previous episode.
+        self.raw_scan_data = np.full(obs_utils.N_SCAN, obs_utils.LIDAR_MAX_RANGE)
+
         time.sleep(0.5)
         rclpy.spin_once(self.node, timeout_sec=0.1)
-        
-        obs = self._get_obs()
-        self.prev_distance = obs[-2] * 10.0
-        
+
+        obs, raw_dist      = self._get_obs()
+        self.prev_distance = raw_dist
+
         return obs, {}
 
+    # ─────────────────────────────────────────── internals ───────────────────
+
     def _get_obs(self):
-        # Calculate goal distance and angle
-        if self.current_odom:
-            pos = self.current_odom.pose.pose.position
-            orient = self.current_odom.pose.pose.orientation
-            
-            # Quaternion to Euler (Yaw)
-            # Simplified for 2D
-            siny_cosp = 2 * (orient.w * orient.z + orient.x * orient.y)
-            cosy_cosp = 1 - 2 * (orient.y * orient.y + orient.z * orient.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-            
-            dist_x = self.goal_x - pos.x
-            dist_y = self.goal_y - pos.y
-            distance = math.sqrt(dist_x**2 + dist_y**2)
-            
-            angle_to_goal = math.atan2(dist_y, dist_x) - yaw
-            # Normalize angle to [-pi, pi]
-            angle_to_goal = (angle_to_goal + math.pi) % (2 * math.pi) - math.pi
-        else:
-            distance = 0.0
-            angle_to_goal = 0.0
+        """Build observation using the shared obs_utils pipeline."""
+        return obs_utils.build_observation(
+            self.raw_scan_data,
+            self.current_odom,
+            self.goal_x,
+            self.goal_y,
+            lidar_noise_std=self.lidar_noise_std,
+        )
 
-        # Normalize scan
-        norm_scan = self.scan_data / 3.5
-        
-        # Normalize goal info
-        norm_dist = np.clip(distance / 10.0, 0.0, 1.0)
-        norm_angle = angle_to_goal / math.pi
-        
-        obs = np.concatenate([norm_scan, [norm_dist, norm_angle]])
-        return obs.astype(np.float32)
+    def _calculate_reward(self, raw_dist: float, action) -> tuple:
+        # Collision check uses the TRUE (un-noised) minimum range so that
+        # domain-randomisation noise cannot mask a real collision event.
+        raw = np.array(self.raw_scan_data, dtype=np.float64)
+        raw = np.nan_to_num(raw, nan=obs_utils.LIDAR_MAX_RANGE,
+                            posinf=obs_utils.LIDAR_MAX_RANGE, neginf=0.0)
+        min_laser = float(np.min(raw))
 
-    def _calculate_reward(self, obs):
-        # obs structure: [scan... , dist, angle]
-        min_laser = np.min(self.scan_data)
-        dist_to_goal = obs[-2] * 10.0 # Un-normalize roughly
-        
         reward = 0.0
-        done = False
-        
-        # Collision
+        done   = False
+
         if min_laser < self.collision_dist:
-            reward = -abs(self.collision_penalty)
-            done = True
-        # Goal Reached
-        elif dist_to_goal < 0.5:
-            reward = abs(self.goal_reached_reward)
-            done = True
+            # Terminal collision penalty.
+            reward = -self.collision_penalty
+            done   = True
+
+        elif raw_dist < self.goal_reached_dist:
+            # Terminal goal-reached reward.
+            reward = self.goal_reached_reward
+            done   = True
+
         else:
-            # Progress reward
-            progress = self.prev_distance - dist_to_goal
-            reward = (progress * 10.0) - 0.1 # Progress bonus - time penalty
-            self.prev_distance = dist_to_goal
-            
+            # Dense progress reward: each step that moves closer to goal.
+            reward += (self.prev_distance - raw_dist) * 10.0
+
+            # Proximity penalty: discourages the policy from hugging walls
+            # even when it avoids hard collision.
+            if min_laser < self.prox_dist:
+                reward -= self.prox_weight * (self.prox_dist - min_laser)
+
+            # Angular velocity penalty: promotes smooth, straight-line motion.
+            reward -= self.ang_penalty_weight * abs(float(action[1]))
+
+            # Per-step time penalty to encourage efficient paths.
+            reward -= 0.1
+
+            self.prev_distance = raw_dist
+
         return reward, done
 
     def close(self):

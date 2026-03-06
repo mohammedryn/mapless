@@ -3,121 +3,154 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from stable_baselines3 import PPO
+from std_msgs.msg import Float64MultiArray
+from stable_baselines3 import PPO, SAC
 import numpy as np
-import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+from mapless_navigation import obs_utils
+
+
 class NavigationNode(Node):
+    """Real-time inference node for the trained DRL navigation policy.
+
+    Runs at 10 Hz. Builds the 362-dimensional observation vector via
+    obs_utils (the same pipeline used in ForestEnv during training), runs
+    model.predict(), and publishes Twist commands to /cmd_vel.
+
+    Preferred odometry source: /odometry/filtered (robot_localization EKF
+    fusing MPU-6050 IMU + rf2o lidar odometry).  Falls back to /odom
+    (raw rf2o) if the EKF node is not running.
+
+    Parameters
+    ----------
+    model_path      : str   — path to the .zip model (omit extension)
+    algorithm       : str   — "ppo" | "sac"
+    max_linear_vel  : float — maximum forward speed (m/s)
+    max_angular_vel : float — maximum rotation rate (rad/s)
+    goal_x          : float — goal x-coordinate in the odometry frame (m)
+    goal_y          : float — goal y-coordinate in the odometry frame (m)
+
+    The goal can be updated at runtime without restarting the node:
+        ros2 topic pub /goal_xy std_msgs/msg/Float64MultiArray '{data: [5.0, 2.0]}'
+    """
+
     def __init__(self):
         super().__init__('navigation_node')
-        
-        # Load Model
-        # Assuming model is in the current directory or specified path
-        # In a real package, this should be a parameter
-        self.declare_parameter('model_path', 'models/ppo_forest_nav')
-        self.declare_parameter('max_linear_vel', 0.26)
+
+        # ── ROS 2 Parameters ──────────────────────────────────────────────────
+        self.declare_parameter('model_path',      'models/ppo_forest_nav')
+        self.declare_parameter('algorithm',       'ppo')
+        self.declare_parameter('max_linear_vel',  0.26)
         self.declare_parameter('max_angular_vel', 1.82)
+        self.declare_parameter('goal_x',          5.0)
+        self.declare_parameter('goal_y',          0.0)
+
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
-        
+        algo       = self.get_parameter('algorithm').get_parameter_value().string_value.lower()
+
+        AlgoClass = SAC if algo == 'sac' else PPO
         try:
-            self.model = PPO.load(model_path)
-            self.get_logger().info(f"Loaded model from {model_path}")
+            self.model = AlgoClass.load(model_path)
+            self.model.set_training_mode(False)
+            self.get_logger().info(f"Loaded {algo.upper()} model from '{model_path}'")
         except Exception as e:
             self.get_logger().error(f"Failed to load model: {e}")
             self.model = None
 
-        # QoS
-        qos_profile = QoSProfile(
+        # ── QoS profile for the lidar subscription ────────────────────────────
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=1,
         )
 
-        # Subscribers
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            qos_profile
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-        
-        # Publisher
+        # ── Subscriptions ─────────────────────────────────────────────────────
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, qos)
+
+        # /odometry/filtered: EKF-fused pose (IMU + rf2o) — preferred.
+        self.create_subscription(
+            Odometry, '/odometry/filtered', self._odom_filtered_cb, 10)
+        # /odom: raw rf2o output — fallback if EKF is not running.
+        self.create_subscription(
+            Odometry, '/odom', self._odom_raw_cb, 10)
+
+        # /goal_xy: runtime goal updates [x, y] without node restart.
+        self.create_subscription(
+            Float64MultiArray, '/goal_xy', self._goal_cb, 10)
+
+        # ── Publisher ─────────────────────────────────────────────────────────
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # State
-        self.scan_data = np.ones(360) * 3.5
-        self.current_odom = None
-        self.goal_x = 5.0 # Default goal
-        self.goal_y = 0.0
-        
-        # Timer for control loop
-        self.create_timer(0.1, self.control_loop) # 10 Hz
 
-    def scan_callback(self, msg):
-        ranges = np.array(msg.ranges)
-        if len(ranges) >= 360:
-            step = len(ranges) // 360
-            self.scan_data = ranges[::step][:360]
-        else:
-            self.scan_data = np.pad(ranges, (0, 360 - len(ranges)), 'constant', constant_values=3.5)
-        
-        self.scan_data = np.nan_to_num(self.scan_data, nan=3.5, posinf=3.5, neginf=0.0)
-        self.scan_data = np.clip(self.scan_data, 0.0, 3.5)
+        # ── State ─────────────────────────────────────────────────────────────
+        self.raw_scan_data    = np.full(obs_utils.N_SCAN, obs_utils.LIDAR_MAX_RANGE)
+        self.odom_filtered    = None   # EKF output (preferred)
+        self.odom_raw         = None   # rf2o fallback
 
-    def odom_callback(self, msg):
-        self.current_odom = msg
+        self.goal_x = float(
+            self.get_parameter('goal_x').get_parameter_value().double_value)
+        self.goal_y = float(
+            self.get_parameter('goal_y').get_parameter_value().double_value)
 
-    def get_obs(self):
-        if self.current_odom:
-            pos = self.current_odom.pose.pose.position
-            orient = self.current_odom.pose.pose.orientation
-            
-            siny_cosp = 2 * (orient.w * orient.z + orient.x * orient.y)
-            cosy_cosp = 1 - 2 * (orient.y * orient.y + orient.z * orient.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-            
-            dist_x = self.goal_x - pos.x
-            dist_y = self.goal_y - pos.y
-            distance = math.sqrt(dist_x**2 + dist_y**2)
-            
-            angle_to_goal = math.atan2(dist_y, dist_x) - yaw
-            angle_to_goal = (angle_to_goal + math.pi) % (2 * math.pi) - math.pi
-        else:
-            distance = 0.0
-            angle_to_goal = 0.0
+        self.create_timer(0.1, self._control_loop)   # 10 Hz
 
-        norm_scan = self.scan_data / 3.5
-        norm_dist = np.clip(distance / 10.0, 0.0, 1.0)
-        norm_angle = angle_to_goal / math.pi
-        
-        obs = np.concatenate([norm_scan, [norm_dist, norm_angle]])
-        return obs.astype(np.float32)
+        self.get_logger().info(
+            f"NavigationNode ready — goal: ({self.goal_x:.2f}, {self.goal_y:.2f})")
 
-    def control_loop(self):
+    # ─────────────────────────────────────────── callbacks ───────────────────
+
+    def _scan_cb(self, msg):
+        self.raw_scan_data = np.array(msg.ranges, dtype=np.float64)
+
+    def _odom_filtered_cb(self, msg):
+        """EKF-fused odometry (IMU + rf2o) — used when robot_localization runs."""
+        self.odom_filtered = msg
+
+    def _odom_raw_cb(self, msg):
+        """Raw rf2o odometry — fallback when EKF node is not running."""
+        self.odom_raw = msg
+
+    def _goal_cb(self, msg):
+        """Update navigation goal at runtime via /goal_xy topic."""
+        if len(msg.data) >= 2:
+            self.goal_x = float(msg.data[0])
+            self.goal_y = float(msg.data[1])
+            self.get_logger().info(
+                f"Goal updated: ({self.goal_x:.2f}, {self.goal_y:.2f})")
+
+    # ─────────────────────────────────────────── control loop ────────────────
+
+    def _control_loop(self):
         if self.model is None:
             return
 
-        obs = self.get_obs()
+        # Prefer EKF-fused odometry; fall back to raw rf2o.
+        odom = (self.odom_filtered
+                if self.odom_filtered is not None
+                else self.odom_raw)
+
+        # Build observation using the SAME pipeline as training (obs_utils).
+        # noise_std=0.0: no artificial noise during deployment.
+        obs, _ = obs_utils.build_observation(
+            self.raw_scan_data,
+            odom,
+            self.goal_x,
+            self.goal_y,
+            lidar_noise_std=0.0,
+        )
+
         action, _ = self.model.predict(obs, deterministic=True)
-        
-        # Action scaling (from config)
-        max_linear_vel = self.get_parameter('max_linear_vel').get_parameter_value().double_value
-        max_angular_vel = self.get_parameter('max_angular_vel').get_parameter_value().double_value
-        
-        linear_vel = (action[0] + 1.0) / 2.0 * max_linear_vel
-        angular_vel = action[1] * max_angular_vel
-        
+
+        max_linear_vel  = (self.get_parameter('max_linear_vel')
+                           .get_parameter_value().double_value)
+        max_angular_vel = (self.get_parameter('max_angular_vel')
+                           .get_parameter_value().double_value)
+
         twist = Twist()
-        twist.linear.x = float(linear_vel)
-        twist.angular.z = float(angular_vel)
+        twist.linear.x  = float((action[0] + 1.0) / 2.0 * max_linear_vel)
+        twist.angular.z = float(action[1] * max_angular_vel)
         self.cmd_vel_pub.publish(twist)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -125,6 +158,7 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

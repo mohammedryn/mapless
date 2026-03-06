@@ -34,8 +34,10 @@ setup(
         'console_scripts': [
             'train_ppo = mapless_navigation.train_ppo:main',
             'navigation_node = mapless_navigation.navigation_node:main',
+            'evaluate_policy = mapless_navigation.evaluate:main',
             'sabertooth_driver = mapless_navigation.sabertooth_driver:main',
             'bts7960_driver = mapless_navigation.bts7960_driver:main',
+            'train_fast = mapless_navigation.train_fast:main',
         ],
     },
 )
